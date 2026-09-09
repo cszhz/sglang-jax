@@ -23,6 +23,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
+from sgl_jax.srt.configs.glm5_next import Glm5NextConfig
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
@@ -43,6 +44,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         BailingHybridConfig,
         KimiLinearConfig,
         GlmMoeDsaConfig,
+        Glm5NextConfig,
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
         Gemma4Config,
@@ -54,6 +56,15 @@ if "glm_moe_dsa" not in CONFIG_MAPPING:
         from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
 
         TOKENIZER_MAPPING._reverse_config_mapping["GlmMoeDsaConfig"] = "gpt2"
+
+# GLM-5.3-Flash needs the same treatment: AutoTokenizer reverse-maps the config
+# class name and KeyErrors on ours. It ships a plain `tokenizer.json`, so any
+# fast-tokenizer entry works as the lookup key.
+if "glm5_next" not in CONFIG_MAPPING:
+    with contextlib.suppress(Exception):
+        from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
+
+        TOKENIZER_MAPPING._reverse_config_mapping["Glm5NextConfig"] = "gpt2"
 
 # Register local configs; suppress() defers to stock on a name clash (fine for
 # bailing/kimi which don't clash, and for the glm stub where stock is preferable).

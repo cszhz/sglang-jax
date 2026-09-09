@@ -267,7 +267,14 @@ def attn_backend_wrapper(
     if cfg is None:
         return full_attn_backend
 
-    if runner.kimi_linear_config is not None or getattr(cfg, "use_kda", False):
+    if (
+        runner.kimi_linear_config is not None
+        or getattr(cfg, "use_kda", False)
+        or runner.glm5_next_config is not None
+    ):
+        # GLM-5.3-Flash's linear layers are KDA too; the only difference from
+        # Kimi-Linear is the bounded gate, which rides on the layer object
+        # (RadixLinearAttention.kda_lower_bound), not on the backend.
         from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 
         linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)

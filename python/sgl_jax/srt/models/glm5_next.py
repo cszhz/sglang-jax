@@ -14,7 +14,7 @@ three are load-bearing:
    *bounded* gate; the other 11 are MLA + DSA indexer. The KDA half is
    structurally identical to ``kimi_linear.py``'s.
 
-Not yet implemented (tracked in ``/zzlfs/glm53flash/Chaneg.md``):
+Not yet implemented:
   - the DSA indexer's k-pooling. Its parameters are declared so the checkpoint
     loads, but ``use_dsa_sparse`` must stay off; the full-attention layers fall
     back to dense MLA over the whole context.
@@ -24,7 +24,9 @@ Not yet implemented (tracked in ``/zzlfs/glm53flash/Chaneg.md``):
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 
 import jax
 import numpy as np
@@ -36,16 +38,23 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.kernels.hyper_connection import hc_weights_pallas
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import FusedEPMoEV2, GateLogit, TopK, create_moe_weights_mapping
+from sgl_jax.srt.layers.moe import (
+    FusedEPMoEV2,
+    GateLogit,
+    TopK,
+    create_moe_weights_mapping,
+)
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -66,14 +75,19 @@ logger = logging.getLogger(__name__)
 _NOPE_PE_WIDTH = 64
 
 
-def _unweighted_rmsnorm(x: jax.Array, eps: float) -> jax.Array:
-    """``Glm5NextTextUnweightedRMSNorm``: RMS norm with no learned scale.
+def _unweighted_rms_scale(x: jax.Array, eps: float) -> jax.Array:
+    """Per-row ``rsqrt(mean(x^2) + eps)`` of ``Glm5NextTextUnweightedRMSNorm``.
 
-    Used only inside the hyper-connection, on the flattened 4-stream vector.
-    Computed in fp32 like the reference.
+    The norm carries no learned scale, so it is nothing but a per-token scalar
+    rescale. Returning that scalar instead of the rescaled tensor lets the one
+    caller apply it *after* the projection — see
+    ``Glm5NextHyperConnection.__call__`` for why that matters.
+
+    The reduction accumulates in fp32 like the reference. The fp32 cast feeds
+    only the reduce, so it never lands in HBM.
     """
-    x = x.astype(jnp.float32)
-    return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + eps)
+    mean_sq = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
+    return jax.lax.rsqrt(mean_sq + eps)
 
 
 class Glm5NextHyperConnection(nnx.Module):
@@ -90,8 +104,13 @@ class Glm5NextHyperConnection(nnx.Module):
     normalized flattened streams, so the checkpoint stores one ``fn`` matrix per
     site plus a per-output ``base`` bias and a 3-entry ``scale``.
 
-    The math runs in fp32 throughout (the reference does the same) — the
-    Sinkhorn iteration divides by row/column sums 20 times and bf16 drifts.
+    The weight math runs in fp32 (the reference does the same) — the Sinkhorn
+    iteration divides by row/column sums 20 times and bf16 drifts. That applies
+    from ``mixed`` onward, where the tensors are ``[T, 24]`` and ``[T, hc, hc]``
+    and fp32 is free; that whole tail lives in ``hc_weights_pallas``. It
+    deliberately does *not* apply to the full-width ``[T, hc*D]`` input:
+    upcasting that is pure HBM traffic, since it is bf16 data either way. See
+    ``__call__``.
     """
 
     def __init__(
@@ -101,6 +120,7 @@ class Glm5NextHyperConnection(nnx.Module):
         hc_sinkhorn_iters: int,
         hc_eps: float,
         rms_norm_eps: float,
+        mesh: jax.sharding.Mesh | None = None,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         self.hidden_size = hidden_size
@@ -108,6 +128,7 @@ class Glm5NextHyperConnection(nnx.Module):
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
         self.hc_eps = hc_eps
         self.rms_norm_eps = rms_norm_eps
+        self.mesh = mesh
 
         self.mix_size = (2 + hc_mult) * hc_mult
         self.flat_size = hc_mult * hidden_size
@@ -121,9 +142,7 @@ class Glm5NextHyperConnection(nnx.Module):
         self.fn = nnx.Param(
             jnp.zeros((self.flat_size, self.mix_size), dtype=dtype, out_sharding=P(None, None))
         )
-        self.base = nnx.Param(
-            jnp.zeros((self.mix_size,), dtype=jnp.float32, out_sharding=P(None))
-        )
+        self.base = nnx.Param(jnp.zeros((self.mix_size,), dtype=jnp.float32, out_sharding=P(None)))
         self.scale = nnx.Param(jnp.zeros((3,), dtype=jnp.float32, out_sharding=P(None)))
 
     def __call__(self, streams: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -133,35 +152,57 @@ class Glm5NextHyperConnection(nnx.Module):
         num_tokens = streams.shape[0]
 
         flat = streams.reshape(num_tokens, self.flat_size)
-        flat = _unweighted_rmsnorm(flat, self.rms_norm_eps)
-        mixed = flat @ self.fn.value.astype(jnp.float32)
-
-        pre_w, post_w, comb_w = jnp.split(mixed, [hc, 2 * hc], axis=-1)
-        pre_b, post_b, comb_b = jnp.split(self.base.value, [hc, 2 * hc])
-        pre_s, post_s, comb_s = (self.scale.value[i] for i in range(3))
-
-        pre = jax.nn.sigmoid(pre_w * pre_s + pre_b) + eps
-        post = 2.0 * jax.nn.sigmoid(post_w * post_s + post_b)
-
-        comb_logits = comb_w.reshape(num_tokens, hc, hc) * comb_s + comb_b.reshape(hc, hc)
-        comb = jax.nn.softmax(comb_logits, axis=-1) + eps
-        # Sinkhorn-Knopp. The reference does one column normalization, then
-        # ``iters - 1`` row+column pairs; fori_loop keeps the traced graph flat
-        # instead of unrolling 19 copies per site (90 sites).
-        comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
-
-        def _sinkhorn_step(_, c):
-            c = c / (jnp.sum(c, axis=-1, keepdims=True) + eps)
-            return c / (jnp.sum(c, axis=-2, keepdims=True) + eps)
-
-        comb = jax.lax.fori_loop(0, self.hc_sinkhorn_iters - 1, _sinkhorn_step, comb)
-
-        collapsed = jnp.einsum("th,thd->td", pre, streams.astype(jnp.float32))
-        return (
-            post.astype(streams.dtype),
-            comb.astype(streams.dtype),
-            collapsed.astype(streams.dtype),
+        # Fold the RMS scale past the projection: the norm is a per-token scalar
+        # and the projection is linear, so ``(x*s) @ fn == (x @ fn) * s``.
+        # Normalizing first would materialize ``flat`` in fp32 — 1.07 GB per site
+        # at T=16384, and a forward pass runs 90 sites — for no precision at all:
+        # ``streams`` and ``fn`` are both bf16, so the upcast hands the MXU no
+        # bits it did not already have, and bf16 x bf16 accumulates into fp32
+        # natively. Everything downstream of ``mixed`` (in particular the 20
+        # Sinkhorn divisions) stays in fp32 exactly as before.
+        inv_rms = _unweighted_rms_scale(flat, self.rms_norm_eps)
+        mixed = (
+            jnp.einsum("tf,fm->tm", flat, self.fn.value, preferred_element_type=jnp.float32)
+            * inv_rms
         )
+
+        # sigmoid pair + softmax + 39 Sinkhorn reduce/divide pairs, all on
+        # [T, 4, 4] tensors, fused into one op. Written out in XLA this tail is
+        # ~80 kernel launches per site and 90 sites run per forward; at decode
+        # the tensors are a few hundred bytes each, so that is ~7000 launches
+        # of pure overhead and the single largest term in TPOT. See
+        # ``hyper_connection/v1/kernel.py``.
+        fn = functools.partial(
+            hc_weights_pallas,
+            hc=hc,
+            eps=eps,
+            iters=self.hc_sinkhorn_iters,
+            out_dtype=streams.dtype,
+        )
+        if self.mesh is not None:
+            # Mosaic kernels are opaque to the SPMD partitioner, so the call has
+            # to see manual mesh axes. The weights are replicated; the token
+            # axis follows whatever ``mixed`` already carries — P("data") under
+            # dp>1, unsharded under dp=1 — and under explicit sharding the
+            # in_specs have to match that exactly rather than assume.
+            tok = jax.typeof(mixed).sharding.spec[0]
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(P(tok, None), P(None), P(None)),
+                out_specs=(P(tok, None), P(tok, None), P(tok, None, None)),
+                check_vma=False,
+            )
+        pre, post, comb = fn(mixed, self.scale.value, self.base.value)
+
+        # The fp32 cast looks like it should materialize 1.07 GB per site at
+        # T=16384, the way normalizing ``flat`` early would above -- but it does
+        # not: XLA folds the convert into the dot, and dropping it in favour of
+        # a bf16 dot with ``preferred_element_type=jnp.float32`` measures the
+        # same to 0.3% and is bit-identical (benchmark/kernels/hyper_connection/
+        # bench_hc_combine.py). Left as-is.
+        collapsed = jnp.einsum("th,thd->td", pre, streams.astype(jnp.float32))
+        return post, comb, collapsed.astype(streams.dtype)
 
 
 def _hc_combine(
@@ -233,14 +274,16 @@ class Glm5NextMLP(nnx.Module):
             scope_name="down_proj",
         )
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(
+        self, hidden_states: jax.Array, out_sharding: jax.sharding.Sharding | None = None
+    ) -> jax.Array:
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
         if self.swiglu_limit is not None:
             limit = jnp.asarray(self.swiglu_limit, dtype=gate.dtype)
             gate = jnp.minimum(gate, limit)
             up = jnp.clip(up, -limit, limit)
-        output, _ = self.down_proj(jax.nn.silu(gate) * up)
+        output, _ = self.down_proj(jax.nn.silu(gate) * up, out_sharding=out_sharding)
         return output
 
 
@@ -348,6 +391,7 @@ class Glm5NextKdaAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         recurrent_state_pool,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, object]:
         num_tokens = hidden_states.shape[0]
 
@@ -367,7 +411,7 @@ class Glm5NextKdaAttention(nnx.Module):
         output_gate, _ = self.g_b_proj(self.g_a_proj(hidden_states)[0])
         output_gate = output_gate.reshape(num_tokens, self.num_heads, self.head_dim)
         o = self.o_norm(o, output_gate).reshape(num_tokens, self.projection_size)
-        o, _ = self.o_proj(o)
+        o, _ = self.o_proj(o, out_sharding=out_sharding)
         return o, recurrent_state_pool
 
 
@@ -375,7 +419,7 @@ class Glm5NextIndexer(nnx.Module):
     """DSA indexer — **parameters only, no forward yet**.
 
     Declared so the checkpoint loads end-to-end while the k-pooling top-k is
-    still unimplemented (step 4 of ``Chaneg.md``). Until then the DSA layers run
+    still unimplemented. Until then the DSA layers run
     dense MLA over the full context: slower, but numerically the ground truth
     the sparse path has to reproduce.
 
@@ -617,10 +661,11 @@ class Glm5NextAttention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if self.use_dsa_sparse:
             raise NotImplementedError(
-                "GLM-5.3 DSA sparse attention needs the k-pooling indexer (Chaneg.md step 4)."
+                "GLM-5.3 DSA sparse attention needs the k-pooling indexer, which is not implemented yet."
             )
         num_tokens = hidden_states.shape[0]
 
@@ -677,8 +722,112 @@ class Glm5NextAttention(nnx.Module):
         ).astype(attn_output.dtype)
         o_v = o_v.transpose(1, 0, 2).reshape(num_tokens, self.num_heads * self.v_head_dim)
 
-        output, _ = self.o_proj(o_v)
+        output, _ = self.o_proj(o_v, out_sharding=out_sharding)
         return output, kv_fused
+
+
+# Benchmarking knob, not a serving option: overwrite the router's decision so the
+# fused MoE kernel can be priced under a controlled expert assignment *in situ*.
+# The model's output is garbage under any non-empty value. It exists because the
+# standalone kernel bench (kernels/fused_moe/v2/bench_v2.py) does not reproduce
+# production timings -- it predicted 1.85x from rebalancing where the real gain
+# was 1.13x -- so the only trustworthy way to size the remaining headroom is to
+# ablate the routing inside the real server.
+#
+# Three modes, because "balanced" and "local" are different properties and the
+# first measurement could not tell them apart: the static permutation moved the
+# imbalance metric 2.81 -> 1.43 for 1.13x, yet mode 1 (metric 1.00) gave 2.25x.
+# Time cannot be that non-linear in one variable, so mode 1 must also be buying
+# something other than balance. The three modes vary the two properties
+# independently:
+#
+#   1  counts exactly equal, expert ids consecutive   (balanced + maximally local)
+#   2  counts exactly equal, expert ids strided       (balanced, locality broken)
+#   3  real counts preserved exactly, tokens shuffled (unbalanced, locality broken)
+#
+# 3 vs. production isolates locality; 1/2 vs. 3 isolates balance. Only the
+# balance part is reachable by redundant experts or a better EPLB, so this is
+# what decides whether --ep-num-redundant-experts is worth its cost.
+_DEBUG_BALANCED_ROUTING = os.environ.get("SGLANG_JAX_DEBUG_BALANCED_ROUTING", "").strip()
+if _DEBUG_BALANCED_ROUTING in ("", "0"):
+    _DEBUG_BALANCED_ROUTING = ""
+
+
+def _shard_local_stride_shuffle(ids: jax.Array) -> jax.Array:
+    """Permute the flat (tokens, slots) axis of one device's shard by a stride."""
+    n, k = ids.shape
+    m = n * k
+    idx = (jax.lax.iota(jnp.int32, m) * 7919) % m
+    return jnp.take(ids.reshape(-1), idx, axis=0).reshape(n, k)
+
+
+def _round_robin_topk_ids(
+    topk_ids: jax.Array,
+    num_physical_experts: int,
+    mode: str,
+    *,
+    mesh=None,
+    token_axes="data",
+) -> jax.Array:
+    """Replace routing with a synthetic assignment; see ``_DEBUG_BALANCED_ROUTING``."""
+    n, k = topk_ids.shape
+    if mode == "3":
+        # Reorder the real ids by a stride permutation. A permutation keeps the
+        # per-expert counts bit-exact -- the load imbalance is untouched --
+        # while moving each id to an unrelated token, so any speedup here is
+        # locality alone. 7919 is prime and the flat length is a power-of-two
+        # multiple of k in every padded shape we compile, so the stride is
+        # always coprime with it and the map is a bijection.
+        #
+        # Shuffling *within* each shard, not globally: the MoE is expert
+        # parallel, so what the kernel sees is its own device's counts. A
+        # global shuffle would both move tokens across devices (changing those
+        # counts, which is exactly the variable being held fixed) and cost an
+        # all-to-all that would land in the measurement.
+        if mesh is None:
+            return _shard_local_stride_shuffle(topk_ids)
+        spec = P(token_axes, None)
+        return jax.shard_map(
+            _shard_local_stride_shuffle,
+            mesh=mesh,
+            in_specs=(spec,),
+            out_specs=spec,
+            check_vma=False,
+        )(topk_ids)
+
+    flat = jax.lax.broadcasted_iota(topk_ids.dtype, (n, k), 0) * k + jax.lax.broadcasted_iota(
+        topk_ids.dtype, (n, k), 1
+    )
+    if mode == "2":
+        # 101 is coprime with 288 (and with 304/320), so this is still a
+        # bijection on each block of num_physical_experts consecutive slots.
+        flat = flat * jnp.asarray(101, topk_ids.dtype)
+    return jax.lax.rem(flat, jnp.asarray(num_physical_experts, topk_ids.dtype))
+
+
+def _router_carries_permutation(config) -> bool:
+    """Whether the EPLB map can be baked into the router instead of applied at runtime.
+
+    Two conditions. The map has to be a pure permutation -- with redundant
+    experts there are more physical slots than router columns, so the router
+    cannot express the mapping at all. And ``n_group`` has to be 1: grouped
+    top-k first picks expert *groups*, which are contiguous column ranges, so
+    permuting the columns would move experts between groups and change the
+    routing decision rather than just relabel it.
+
+    Where it holds, ``create_moe_weights_mapping``'s caller permutes the router
+    kernel and bias at load time and the forward pass skips
+    ``topk_ids_logical_to_physical`` -- worth 37.7 ms/core/step on a 200K
+    prefill, which is more than the rebalancing itself saves.
+    """
+    from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        return False
+    if getattr(config, "n_group", 1) not in (0, 1, None):
+        return False
+    return int(metadata.num_physical_experts) == int(config.n_routed_experts)
 
 
 class Glm5NextDecoderLayer(nnx.Module):
@@ -720,11 +869,13 @@ class Glm5NextDecoderLayer(nnx.Module):
                 hc_sinkhorn_iters=config.hc_sinkhorn_iters,
                 hc_eps=config.hc_eps,
                 rms_norm_eps=config.rms_norm_eps,
+                mesh=mesh,
                 dtype=dtype,
             )
 
         self.attn_hc = _hc_site()
         self.ffn_hc = _hc_site()
+        self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
 
         self.is_moe_layer = config.is_sparse_mlp_layer(layer_id)
         if not self.is_moe_layer:
@@ -753,10 +904,22 @@ class Glm5NextDecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 mesh=mesh,
             )
+            self.router_is_physical = _router_carries_permutation(config)
+            # Physical, not logical: with redundant experts FusedEPMoEV2 widens
+            # to metadata.num_physical_experts and the debug round-robin has to
+            # deal across the same range.
+            from sgl_jax.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
+
+            _md = get_global_expert_location_metadata()
+            self.num_physical_experts = (
+                int(_md.num_physical_experts) if _md is not None else config.n_routed_experts
+            )
             moe_backend = getattr(config, "moe_backend", MoEBackend.FUSED_V2)
             if moe_backend != MoEBackend.FUSED_V2.value:
                 raise NotImplementedError(
-                    f"GLM-5.3 needs the fused_v2 MoE backend (in-kernel shared expert "
+                    f"GLM-5.3 needs the fused_v2 MoE backend (shared expert "
                     f"and swiglu_limit); got {moe_backend!r}"
                 )
             num_shared_experts = config.n_shared_experts
@@ -839,6 +1002,25 @@ class Glm5NextDecoderLayer(nnx.Module):
                 ),
             )
 
+    def _token_axes(self, streams: jax.Array):
+        """Mesh axes the token dim is split over: ('data','tensor') under SP, else 'data'.
+
+        Derived from ``make_reduce_sharding`` rather than from the flag alone so
+        the ``should_scatter`` threshold applies -- a decode step has too few
+        tokens to split 16 ways and has to stay on the DP layout.
+        """
+        return make_reduce_sharding(
+            streams, self.mesh, enable_sp=self.enable_sequence_parallel
+        ).spec[0]
+
+    def _sp_streams(self, streams: jax.Array) -> NamedSharding:
+        """Sharding for the ``[T, hc, D]`` residual streams."""
+        return NamedSharding(self.mesh, P(self._token_axes(streams), None, None))
+
+    def _sp_hidden(self, streams: jax.Array) -> NamedSharding:
+        """Sharding for a ``[T, D]`` block input/output, matching the streams."""
+        return NamedSharding(self.mesh, P(self._token_axes(streams), None))
+
     @named_scope
     def __call__(
         self,
@@ -847,18 +1029,45 @@ class Glm5NextDecoderLayer(nnx.Module):
         memory_pools,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, object, jax.Array | None]:
+        # Sequence parallelism. The 4-wide residual stream is the most expensive
+        # tensor in the model -- bf16[T, 4, D] is 537 MB at T=16384 -- and under
+        # plain TP every one of the 16 cores holds all of it and redoes the same
+        # elementwise work on it. Splitting the token axis across ('data',
+        # 'tensor') makes the hyper-connection sites, the layernorms and the
+        # residual adds 16x cheaper. Collective traffic is unchanged: the
+        # all-reduce that used to close each block becomes a reduce-scatter
+        # (requested via ``out_sharding`` below) plus the all-gather that feeds
+        # the next block's column-parallel matmul.
+        #
+        # ``sp_streams`` is a no-op after the first layer -- the previous layer
+        # already left ``streams`` on this sharding -- and ``make_reduce_sharding``
+        # degrades to plain DP when the token count is too small to split, so
+        # decode keeps its current layout untouched.
+        streams = jax.sharding.reshard(streams, self._sp_streams(streams))
+        sp_tokens = self._sp_hidden(streams)
+        all_tokens = NamedSharding(self.mesh, P("data", None))
+
         # ── attention site ──
         residual = streams
         post, comb, hidden_states = self.attn_hc(streams)
         hidden_states = self.input_layernorm(hidden_states)
 
+        # Attention needs every token: the token axis is the sequence, and the
+        # parallelism inside the block is over heads.
+        hidden_states = jax.sharding.reshard(hidden_states, all_tokens)
         if self.is_kda:
             hidden_states, attn_state = self.self_attn(
-                hidden_states, forward_batch, memory_pools.recurrent_state_pool
+                hidden_states,
+                forward_batch,
+                memory_pools.recurrent_state_pool,
+                out_sharding=sp_tokens,
             )
         else:
             hidden_states, attn_state = self.self_attn(
-                hidden_states, forward_batch, memory_pools.token_to_kv_pool
+                hidden_states,
+                forward_batch,
+                memory_pools.token_to_kv_pool,
+                out_sharding=sp_tokens,
             )
         streams = _hc_combine(post, comb, hidden_states, residual)
 
@@ -868,6 +1077,13 @@ class Glm5NextDecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
+            # No all-gather here, unlike the attention site. FusedEPMoEV2 reshards
+            # its three token-indexed inputs to P(('data','tensor'), None) before
+            # calling the kernel, whose own shard_map in_specs are the same --
+            # gathering first would only buy an all-gather plus the slice that
+            # undoes it. Routing runs on the SP shard for the same reason: the
+            # router is a per-token [D, E] matmul with no cross-token term, so
+            # 1/16 of the tokens per core is 1/16 of the work.
             with jax.named_scope("moe"):
                 router_logits = self.moe_gate(hidden_states)
                 correction_bias = (
@@ -875,11 +1091,24 @@ class Glm5NextDecoderLayer(nnx.Module):
                 )
                 with jax.named_scope("topk"):
                     topk_weights, topk_ids = self.topk(
-                        router_logits, correction_bias, dispatch_info=dispatch_info
+                        router_logits,
+                        correction_bias,
+                        # Router columns were already permuted at load time, so
+                        # top-k emits physical ids and there is nothing to map.
+                        dispatch_info=None if self.router_is_physical else dispatch_info,
+                        routing_sharding=sp_tokens,
+                    )
+                if _DEBUG_BALANCED_ROUTING:
+                    topk_ids = _round_robin_topk_ids(
+                        topk_ids,
+                        self.num_physical_experts,
+                        _DEBUG_BALANCED_ROUTING,
+                        mesh=self.mesh,
+                        token_axes=self._token_axes(streams),
                     )
                 token_valid_mask = forward_batch.get_token_valid_mask(
                     hidden_states.shape[0],
-                    out_sharding=NamedSharding(self.mesh, P("data")),
+                    out_sharding=NamedSharding(self.mesh, P(self._token_axes(streams))),
                 )
                 if token_valid_mask is not None:
                     valid = token_valid_mask[:, None]
@@ -890,11 +1119,17 @@ class Glm5NextDecoderLayer(nnx.Module):
                     hidden_states,
                     topk_weights,
                     topk_ids,
+                    out_sharding=sp_tokens,
                     swiglu_limit=self.swiglu_limit,
                     shared_swiglu_limit=self.swiglu_limit,
                 )
         else:
-            hidden_states = self.mlp(hidden_states)
+            # The dense MLP of the first_k_dense_replace layers *does* need the
+            # gather: gate/up are column-parallel over 'tensor', so a token axis
+            # also split over 'tensor' would ask one mesh axis to shard two dims
+            # of the same matmul.
+            hidden_states = jax.sharding.reshard(hidden_states, all_tokens)
+            hidden_states = self.mlp(hidden_states, out_sharding=sp_tokens)
             topk_ids = None
 
         streams = _hc_combine(post, comb, hidden_states, residual)
@@ -911,6 +1146,7 @@ class Glm5NextModel(nnx.Module):
         self.config = config
         self.hc_mult = config.hc_mult
         self.vocab_size = config.vocab_size
+        self.mesh = mesh
 
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
@@ -961,6 +1197,12 @@ class Glm5NextModel(nnx.Module):
             else:
                 layers_kv_fused.append(attn_state)
             layers_topk_ids.append(topk_ids)
+
+        # Close sequence parallelism before the head. The layers leave
+        # ``streams`` split over ('data','tensor') on the token axis; the logits
+        # path indexes individual tokens and expects the plain DP layout. A
+        # reshard is a no-op when SP did not engage (decode).
+        streams = jax.sharding.reshard(streams, NamedSharding(self.mesh, P("data", None, None)))
 
         # ``Glm5NextTextHyperHead``: an unweighted mean over the 4 streams.
         hidden_states = jnp.mean(streams, axis=1)
@@ -1038,7 +1280,15 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         # quantization_config) are attached to the root by ModelRunner /
         # ModelConfig, so forward them onto the text config the submodules see.
         text_config: Glm5NextTextConfig = config.text_config
-        for attr in ("ep_size", "moe_backend", "quantization_config", "use_dsa_sparse"):
+        for attr in (
+            "ep_size",
+            "moe_backend",
+            "quantization_config",
+            "use_dsa_sparse",
+            # ModelRunner sets this on the root config only, but the decoder
+            # layers read it off text_config.
+            "enable_sequence_parallel",
+        ):
             value = getattr(config, attr, None)
             if value is not None:
                 setattr(text_config, attr, value)
@@ -1279,19 +1529,35 @@ class Glm5NextForConditionalGeneration(nnx.Module):
                 add_linear(f"{src_prefix}.mlp.{name}", f"{tgt_prefix}.mlp.{name}", sharding)
             return mappings
 
-        mappings[f"{src_prefix}.mlp.gate.weight"] = WeightMapping(
-            target_path=f"{tgt_prefix}.moe_gate.kernel", sharding=(None, None), transpose=True
-        )
-        mappings[f"{src_prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
-            target_path=f"{tgt_prefix}.moe_gate.bias", sharding=(None,)
-        )
-
         from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 
         metadata = get_global_expert_location_metadata()
         phy_to_log = None
         if metadata is not None:
             phy_to_log = np.array(jax.device_get(metadata.physical_to_logical_map))[layer_id]
+
+        # Permute the router to match, so top-k emits physical expert ids
+        # directly and the runtime logical->physical gather can be skipped.
+        # Measured on a 200K prefill, that gather costs 37.7 ms/core/step --
+        # more than the 29.5 ms the rebalancing saves in the MoE kernel, so
+        # without this the remap is a net loss. Safe only for a pure
+        # permutation (num_physical == num_logical) and only because GLM-5.3
+        # has n_group=1: with expert groups, reordering the columns would move
+        # experts across group boundaries and change which group top-k picks.
+        # See TopK.__call__, which drops dispatch_info under the same condition.
+        gate_perm = phy_to_log if _router_carries_permutation(config) else None
+
+        mappings[f"{src_prefix}.mlp.gate.weight"] = WeightMapping(
+            target_path=f"{tgt_prefix}.moe_gate.kernel",
+            sharding=(None, None),
+            transpose=True,
+            expert_permutation=gate_perm,
+        )
+        mappings[f"{src_prefix}.mlp.gate.e_score_correction_bias"] = WeightMapping(
+            target_path=f"{tgt_prefix}.moe_gate.bias",
+            sharding=(None,),
+            expert_permutation=gate_perm,
+        )
 
         moe_backend = getattr(config, "moe_backend", "fused_v2")
         moe_mappings = create_moe_weights_mapping(

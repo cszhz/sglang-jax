@@ -69,6 +69,31 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
     return data
 
 
+def _apply_expert_permutation(
+    weight: jax.Array, mapping: "WeightMapping", context: str
+) -> jax.Array:
+    """Reorder the axis of ``weight`` that indexes experts.
+
+    The axis is found by length rather than named explicitly: the router
+    kernel arrives as [hidden, experts] (after transpose) and the correction
+    bias as [experts], so there is no single axis index that fits both. Refuse
+    an ambiguous match rather than silently permuting the wrong axis -- a
+    wrong router permutation is numerically silent but routes every token to
+    the wrong expert.
+    """
+    perm = mapping.expert_permutation
+    if perm is None:
+        return weight
+    n = len(perm)
+    axes = [i for i, d in enumerate(weight.shape) if d == n]
+    if len(axes) != 1:
+        raise ValueError(
+            f"{context}: expert_permutation of length {n} matches {len(axes)} axes "
+            f"of shape {weight.shape}; cannot tell which one indexes experts"
+        )
+    return jnp.take(weight, jnp.asarray(perm), axis=axes[0])
+
+
 @dataclass
 class WeightMapping:
     target_path: str | list[str]
@@ -84,6 +109,12 @@ class WeightMapping:
     concat_axis: int | None = None
     is_eagle3: bool = False
     physical_to_logical_map: np.ndarray | None = None
+    # Reorder one axis of the loaded tensor. ``physical_to_logical_map`` above
+    # relocates *stacked* expert weights (one source tensor per expert); this
+    # is for a single tensor that carries an expert axis, i.e. the MoE router's
+    # kernel and bias. Baking the EPLB permutation into the router at load time
+    # is what lets the runtime skip the per-layer logical->physical gather.
+    expert_permutation: np.ndarray | None = None
 
     def __post_init__(self):
         if self.sharding is None:
@@ -2060,6 +2091,10 @@ class WeightLoader:
                         elif mapping.transpose:
                             lazy_weight = jnp.transpose(lazy_weight, (1, 0))
 
+                        lazy_weight = _apply_expert_permutation(
+                            lazy_weight, mapping, f"fast load {hf_key}"
+                        )
+
                         if "lm_head" in hf_key and hasattr(
                             self.model_config.hf_config, "output_multiplier_scale"
                         ):
@@ -2539,6 +2574,10 @@ class WeightLoader:
             processed_weight = jnp.transpose(processed_weight, mapping.transpose_axes)
         elif mapping.transpose and not hf_key.endswith(".bias"):
             processed_weight = jnp.transpose(processed_weight, (1, 0))
+
+        processed_weight = _apply_expert_permutation(
+            processed_weight, mapping, f"slow load {hf_key}"
+        )
 
         if isinstance(mapping.target_path, list):
             self._handle_split_weight(params, hf_key, processed_weight, mapping)

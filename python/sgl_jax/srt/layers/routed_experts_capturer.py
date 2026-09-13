@@ -565,6 +565,7 @@ class _ExpertDistributionRecorder:
             (self.num_layers, self.physical_expert_counts), dtype=np.int64
         )
         self._steps_accumulated = 0
+        self._dumps = 0
         self._lock = threading.Lock()
 
     def add_topk_ids(
@@ -579,6 +580,22 @@ class _ExpertDistributionRecorder:
         with self._lock:
             for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
                 if ids_cpu is None:
+                    continue
+                # The per-DP-rank slicing below is a *decode* layout: one row per
+                # request, padded to per_dp_bs_size. On extend/prefill the rows are
+                # tokens, not requests, so that slicing would count only the first
+                # `real_bs` tokens of a 16K-token chunk -- one token for a single
+                # 200K request. Detect it by the row count and count every row
+                # instead; padded token slots are already -1 (the model masks them
+                # with the token_valid_mask before calling the MoE).
+                padded_rows = per_dp_bs_size * len(real_bs_per_dp)
+                if not real_bs_per_dp or ids_cpu.shape[0] > padded_rows:
+                    flat = ids_cpu.reshape(-1)
+                    valid_ids = flat[flat >= 0]
+                    if valid_ids.size > 0:
+                        self._physical_counts[layer_idx] += np.bincount(
+                            valid_ids, minlength=self.physical_expert_counts
+                        )[: self.physical_expert_counts]
                     continue
                 for dp_rank, real_bs in enumerate(real_bs_per_dp):
                     if real_bs <= 0:
@@ -627,14 +644,22 @@ class _ExpertDistributionRecorder:
         # Only process 0 saves to file
         # if jax.process_index() == 0:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        # The suffix carries the process index and a dump counter as well as the
+        # timestamp: every process runs its own recorder, and with a small
+        # buffer_size several dumps land inside the same minute -- on either
+        # collision the earlier file would be silently overwritten.
+        suffix = f"{timestamp}_p{jax.process_index()}_{self._dumps:04d}"
+        self._dumps += 1
         base_path = self.output_file
         if base_path.endswith(".npy"):
-            filename = base_path.replace(".npy", f"_{timestamp}.npy")
+            filename = base_path.replace(".npy", f"_{suffix}.npy")
         else:
-            filename = f"{base_path}_{timestamp}.npy"
+            filename = f"{base_path}_{suffix}.npy"
 
         output_data = {
             "logical_count": logical_counts,
+            "physical_count": self._physical_counts.copy(),
+            "steps": self._steps_accumulated,
             "timestamp": timestamp,
         }
         np.save(filename, output_data)

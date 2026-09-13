@@ -160,7 +160,9 @@ class TopK(nnx.Module):
                 )
 
         if dispatch_info is not None:
-            topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, dispatch_info, self.layer_id, mesh=self.mesh, routing_spec=routing_spec
+            )
 
         if self.renormalize:
             topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))

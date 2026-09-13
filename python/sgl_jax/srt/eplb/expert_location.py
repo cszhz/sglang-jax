@@ -6,6 +6,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -179,11 +180,37 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
-        num_logical_experts = getattr(model_config.hf_config, "num_experts", 0)
-        num_layers = getattr(model_config.hf_config, "num_hidden_layers", 0)
-        num_groups = getattr(model_config.hf_config, "num_expert_group", 1)
+        # Read through hf_text_config first, then hf_config, and accept every
+        # spelling of the expert-count fields. Reading only
+        # ``hf_config.num_experts`` silently returns None -- i.e. EPLB off, no
+        # warning -- for any model that either nests its text config (GLM-5.3's
+        # root config holds only the multimodal wrapper) or names the field
+        # ``n_routed_experts`` / ``num_local_experts``. GLM-5.3-Flash hits both.
+        # Same alias set as layers/routed_experts_capturer.
+        def cfg_get(names, default):
+            for cfg in (
+                getattr(model_config, "hf_text_config", None),
+                getattr(model_config, "hf_config", None),
+            ):
+                if cfg is None:
+                    continue
+                for name in names:
+                    value = getattr(cfg, name, None)
+                    if value is not None:
+                        return value
+            return default
+
+        num_logical_experts = cfg_get(("num_experts", "n_routed_experts", "num_local_experts"), 0)
+        num_layers = cfg_get(("num_hidden_layers",), 0)
+        num_groups = cfg_get(("num_expert_group", "n_group"), 1)
 
         if num_logical_experts == 0 or num_layers == 0:
+            logger.warning(
+                "EPLB disabled: could not read expert count / layer count from the "
+                "model config (got num_logical_experts=%s num_layers=%s).",
+                num_logical_experts,
+                num_layers,
+            )
             return None
 
         ep_size = server_args.ep_size
@@ -339,15 +366,34 @@ def topk_ids_logical_to_physical(
     topk_ids: jax.Array,
     info: ExpertLocationMetadata | None,
     layer_id: int = 0,
+    mesh: "jax.sharding.Mesh | None" = None,
+    routing_spec=None,
 ) -> jax.Array:
     """
     Maps logical expert IDs to physical expert IDs.
     Because 'info' contains Static arrays, JAX will use the concrete values during trace.
+
+    ``mesh`` is not optional in practice for the static path: the lookup is an
+    advanced index whose *indices* are sharded, so JAX has to derive the
+    gather's output sharding, and inside the model's jit there is no mesh in
+    scope ("Resource axis: data of P('data', None) is not found in mesh: ()").
+    Given a mesh the lookup runs under shard_map instead -- each device gathers
+    from its own replica of the table, which is what we want anyway -- matching
+    how layers/gate.py already wraps the top-k Pallas kernels.
     """
     if info is None:
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
+        if mesh is not None:
+            spec = routing_spec if routing_spec is not None else P("data", None)
+            return jax.shard_map(
+                lambda ids, table: table[layer_id, ids],
+                mesh=mesh,
+                in_specs=(spec, P(None, None)),
+                out_specs=spec,
+                check_vma=False,
+            )(topk_ids, info.logical_to_rank_dispatch_physical_map)
         return _topk_ids_logical_to_physical_static(topk_ids, info, layer_id)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info, layer_id)

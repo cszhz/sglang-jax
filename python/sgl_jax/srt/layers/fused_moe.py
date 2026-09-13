@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import os
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -11,10 +13,73 @@ from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_e
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
+
 def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> jax.Array:
     """Expand compact 2D MoE block scales to the kernel's fast 1D-ready layout."""
     scale_per_channel = jnp.repeat(scale_3d, block_n, axis=2)[..., :n_out]
     return scale_per_channel[:, :, None, :]
+
+
+def _shared_expert_dense(
+    tokens: jax.Array,  # [T, H], already in the kernel's token-sharded layout
+    w1: jax.Array,  # [H, I_se]
+    w3: jax.Array,  # [H, I_se]
+    w2: jax.Array,  # [I_se, H]
+    w1_scale: jax.Array | None,  # [1, I_se] per output channel
+    w3_scale: jax.Array | None,
+    w2_scale: jax.Array | None,  # [1, H]
+    act_fn: str,
+    swiglu_limit: float | None,
+) -> jax.Array:
+    """Shared expert as a plain dense MLP, outside the fused MoE kernel.
+
+    Same math as the reference at ``fused_moe/v2/kernel.py:200`` — the weights
+    are replicated and the tokens are already sharded, so this is three local
+    matmuls with no collectives. The scales are per *output* channel, so
+    ``(x @ w) * s`` equals ``x @ (w * s)`` exactly while avoiding a dequantized
+    weight buffer, and the accumulation stays fp32 throughout.
+
+    Running it here rather than inside the kernel is what makes the routed path
+    fast: the in-kernel shared expert requires ``bt <= bts`` and a ``bse`` wide
+    enough to hold it (1024 at this shape). Freed of both, the re-swept winner
+    is 3.797 ms -> 2.486 ms per layer at EP16, 16384 tokens. The larger half of
+    that is ``bse`` 1024 -> 256 (3.685 -> 2.671 at otherwise identical blocks),
+    not ``bt``: the bt=256 runner-up is 2.503, within noise of the 2.486 winner.
+
+    Measured under the bench's balanced ``random`` gating. Real routing is
+    skewed and the kernel is load-bound there -- under ``hot_expert`` the same
+    two configs are 14.638 / 14.493, i.e. this win all but vanishes. It is
+    still a win in situ (-1.3% TTFT), just a much smaller one.
+    """
+    from sgl_jax.srt.kernels.fused_moe.v2.kernel import activation_fn
+
+    compute_dtype = tokens.dtype
+
+    def half(w, scale):
+        acc = jax.lax.dot_general(
+            tokens,
+            w.astype(compute_dtype),
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        return acc if scale is None else acc * scale.astype(jnp.float32)
+
+    act = activation_fn(half(w1, w1_scale), half(w3, w3_scale), act_fn, swiglu_limit)
+    out = jax.lax.dot_general(
+        act.astype(compute_dtype),
+        w2.astype(compute_dtype),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    if w2_scale is not None:
+        out = out * w2_scale.astype(jnp.float32)
+    return out.astype(tokens.dtype)
 
 
 class FusedEPMoE(nnx.Module):
@@ -77,6 +142,11 @@ class FusedEPMoE(nnx.Module):
         disable_all_reduce_metadata: bool = False,
         disable_sync_barrier: bool = False,
         use_jax_allreduce_metadata: bool = True,
+        # v2 only: run the shared expert as a separate dense MLP instead of
+        # inside the fused kernel. See _shared_expert_dense -- the in-kernel
+        # form costs the routed path more (bt pinned at 256) than the shared
+        # expert itself is worth. None = take the env default.
+        external_shared_expert: bool | None = None,
     ):
         self.hidden_size = hidden_size
         self.num_experts_per_tok = num_experts_per_tok
@@ -106,6 +176,11 @@ class FusedEPMoE(nnx.Module):
         self.disable_all_reduce_metadata = disable_all_reduce_metadata
         self.disable_sync_barrier = disable_sync_barrier
         self.use_jax_allreduce_metadata = use_jax_allreduce_metadata
+        self.external_shared_expert = (
+            _env_bool("SGLANG_JAX_MOE_EXTERNAL_SHARED_EXPERT", False)
+            if external_shared_expert is None
+            else external_shared_expert
+        )
 
         metadata = get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -557,6 +632,7 @@ class FusedEPMoEV2(FusedEPMoE):
     ) -> jax.Array:
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            DEFAULT_V2_BLOCK_CONFIG,
             get_tuned_fused_moe_v2_block_config,
         )
 
@@ -595,8 +671,8 @@ class FusedEPMoEV2(FusedEPMoE):
             else ("per_channel" if quant_block_k is None else "blockwise")
         )
 
-        if block_config is None:
-            block_config = get_tuned_fused_moe_v2_block_config(
+        def lookup_block_config(use_shared_expert: bool):
+            return get_tuned_fused_moe_v2_block_config(
                 num_tokens=hidden_states.shape[0],
                 num_experts=self.num_experts,
                 top_k=self.num_experts_per_tok,
@@ -605,11 +681,49 @@ class FusedEPMoEV2(FusedEPMoE):
                 dtype=hidden_states.dtype,
                 weight_dtype=self.w1.value.dtype,
                 ep_size=self.ep_size,
-                use_shared_expert=self.w1_shared is not None,
+                use_shared_expert=use_shared_expert,
                 use_grouped_topk=self.use_grouped_topk,
                 enable_act_quant=enable_act_quant,
                 quant_mode=quant_mode,
             )
+
+        # Hand the kernel w*_shared=None and it runs routed-only, which lifts
+        # the in-kernel shared expert's block constraints: bt <= bts, and a bse
+        # wide enough for the shared expert (1024 at this shape). Freeing both
+        # takes GLM-5.3-Flash's 16384-token prefill from (256,1024,128,1024,256)
+        # at 3.797 ms to (512,1024,256,256,256) at 2.486 ms per layer per device
+        # at EP16. The shared expert is then computed below, after the reshard,
+        # against the same token-sharded layout.
+        #
+        # Only where a routed-only config has actually been tuned, though: the
+        # constraint does not bind at small bt (decode blocks at bt=8 satisfy it
+        # for free), and falling back to DEFAULT_V2_BLOCK_CONFIG -- which was
+        # tuned for H=6144 and under-blocks H=4096 -- would cost far more than
+        # the shared expert is worth. A miss keeps today's in-kernel behavior
+        # exactly, so no token bucket can regress; tuning a new routed-only
+        # entry is all it takes to opt that bucket in.
+        run_shared_externally = self.external_shared_expert and w1_shared_val is not None
+        if run_shared_externally and block_config is None:
+            external_config = lookup_block_config(use_shared_expert=False)
+            if external_config is DEFAULT_V2_BLOCK_CONFIG:
+                run_shared_externally = False
+            else:
+                block_config = external_config
+
+        if run_shared_externally:
+            shared_weights = (
+                w1_shared_val,
+                w3_shared_val,
+                w2_shared_val,
+                w1_shared_scale,
+                w3_shared_scale,
+                w2_shared_scale,
+            )
+            w1_shared_val = w3_shared_val = w2_shared_val = None
+            w1_shared_scale = w3_shared_scale = w2_shared_scale = None
+
+        if block_config is None:
+            block_config = lookup_block_config(use_shared_expert=w1_shared_val is not None)
 
         direct_scaled_dot = w1_scale is not None
         kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
@@ -645,6 +759,14 @@ class FusedEPMoEV2(FusedEPMoE):
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
+
+        if run_shared_externally:
+            output = output + _shared_expert_dense(
+                hidden_states,
+                *shared_weights,
+                act_fn=self.activation,
+                swiglu_limit=shared_swiglu_limit,
+            )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
         # parallelism out_sharding carries the SP-aware reduce_sharding

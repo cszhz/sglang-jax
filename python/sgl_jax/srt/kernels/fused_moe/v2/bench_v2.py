@@ -317,11 +317,19 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
-valid_routing_modes = {"random", "deterministic", "hot_expert"}
+valid_routing_modes = {"random", "deterministic", "hot_expert", "replay"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
-        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; expected one of random or deterministic."
+        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; expected one of "
+        f"{sorted(valid_routing_modes)}."
     )
+# 'replay' reads a per-expert assignment histogram measured on the real model
+# (dump one with RoutedExpertsCapturer) and synthesises topk_ids with that
+# histogram. Balanced synthetic gating is what hid the real MoE cost.
+replay_counts_path = os.environ.get("BENCH_ROUTING_COUNTS", "")
+replay_layer = int(os.environ.get("BENCH_ROUTING_LAYER", "-1"))
+if routing_mode == "replay" and not replay_counts_path:
+    raise ValueError("BENCH_ROUTING_MODE=replay needs BENCH_ROUTING_COUNTS=<counts .npy>")
 if use_split:
     timeit_fn = None
     timing_label = "split"
@@ -747,6 +755,83 @@ def make_deterministic_topk(num_tokens, top_k, num_experts):
     return topk_weights, topk_ids
 
 
+def make_replay_topk(num_tokens, top_k, num_experts, counts_path, layer):
+    """topk_ids whose global expert histogram matches a measured one.
+
+    ``counts_path`` is a [num_layers, num_experts] int array of assignment
+    counts recorded from a real forward pass; ``layer`` selects one, or -1 pools
+    every layer that saw traffic. Only the *shape* of the histogram is used --
+    it is rescaled to this bench's num_tokens * top_k slots.
+
+    Rows are made duplicate-free (a token never routes to the same expert
+    twice) because the real router picks top_k distinct experts; leaving
+    duplicates in would understate the number of distinct (expert, token)
+    pairs the kernel has to stage.
+    """
+    raw = np.load(counts_path, allow_pickle=True)
+    if raw.dtype == object:  # a dict dump straight from the recorder
+        raw = raw.item()
+        raw = raw.get("physical_count", raw["logical_count"])
+    raw = np.asarray(raw, dtype=np.float64)
+    if raw.ndim == 2:
+        hist = raw[layer] if layer >= 0 else raw[raw.sum(axis=1) > 0].sum(axis=0)
+    else:
+        hist = raw
+    if hist.shape[0] != num_experts:
+        raise ValueError(f"counts have {hist.shape[0]} experts, bench has {num_experts}")
+    if hist.sum() <= 0:
+        raise ValueError(f"counts at layer {layer} are all zero")
+
+    slots = num_tokens * top_k
+    # Largest-remainder rounding so the total is exactly `slots`.
+    exact = hist / hist.sum() * slots
+    take = np.floor(exact).astype(np.int64)
+    short = slots - int(take.sum())
+    if short > 0:
+        order = np.argsort(-(exact - take))
+        take[order[:short]] += 1
+
+    rng = np.random.default_rng(1234)
+    flat = np.repeat(np.arange(num_experts, dtype=np.int32), take)
+    rng.shuffle(flat)
+    ids_np = flat.reshape(num_tokens, top_k)
+    # Repair duplicate rows by swapping the offending slot with a random slot
+    # elsewhere. Each pass fixes most of them; on a realistically skewed
+    # histogram it converges in a few passes (4 bad rows of 16384 after one
+    # pass). Colliding partners inside one vectorised swap perturb the
+    # histogram by <0.1% of the largest bin, which does not matter for timing.
+    for _ in range(32):
+        srt = np.sort(ids_np, axis=1)
+        bad_rows = np.nonzero((srt[:, 1:] == srt[:, :-1]).any(axis=1))[0]
+        if bad_rows.size == 0:
+            break
+        partner = rng.integers(0, num_tokens, size=bad_rows.size)
+        slot_a = rng.integers(0, top_k, size=bad_rows.size)
+        slot_b = rng.integers(0, top_k, size=bad_rows.size)
+        tmp = ids_np[bad_rows, slot_a].copy()
+        ids_np[bad_rows, slot_a] = ids_np[partner, slot_b]
+        ids_np[partner, slot_b] = tmp
+    else:
+        log(f"  replay: {bad_rows.size} rows still have duplicate experts (of {num_tokens})")
+
+    local_tokens = num_tokens // num_devices
+    per_device_ids, per_device_weights = [], []
+    for i, dev in enumerate(jax.local_devices()):
+        gdev = jax.process_index() * len(jax.local_devices()) + i
+        chunk = ids_np[gdev * local_tokens : (gdev + 1) * local_tokens]
+        per_device_ids.append(jax.device_put(jnp.array(chunk), dev))
+        per_device_weights.append(
+            jax.device_put(jnp.full((local_tokens, top_k), 1.0 / top_k, dtype=jnp.float32), dev)
+        )
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_ids
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k), ep_sharding, per_device_weights
+    )
+    return topk_weights, topk_ids
+
+
 def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=0.7):
     """Hot-expert routing: hot_load fraction of (token, k) slots route to
     hot_frac fraction of experts; rest uniformly to the cold tail."""
@@ -963,6 +1048,10 @@ for num_tokens in token_candidates:
         topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
     elif routing_mode == "hot_expert":
         topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
+    elif routing_mode == "replay":
+        topk_wts, topk_idx = make_replay_topk(
+            num_tokens, top_k, E, replay_counts_path, replay_layer
+        )
     else:
         gating_local_shape = (num_tokens // num_devices, E)
         gating_per_dev = []

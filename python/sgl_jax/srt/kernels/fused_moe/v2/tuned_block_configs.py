@@ -9,6 +9,7 @@ Same lookup approach as v1/tuned_block_configs.py but with v2's simpler
 from __future__ import annotations
 
 import logging
+import os
 
 import jax.numpy as jnp
 
@@ -81,6 +82,68 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
+        # GLM-5.3-Flash: E=288, H=4096, I=2048, top_k=8, routed FP8 block-wise
+        # K=128, ep=16, in-kernel shared expert (I_se=2048), act_quant ON,
+        # n_group=1 -> no grouped top-k.
+        # Tuned 2026-09-10 on 2 hosts of mig-0905 (8 v7x chips / 16 JAX devices)
+        # with bench_v2.py BENCH_TUNE=1 BENCH_MAX_CONFIGS=40. Measured twice,
+        # agreeing to 0.003 ms. 11-field key (no quant_mode) so blockwise and
+        # per-channel both land here; this shape only ships blockwise.
+        #
+        # Why it matters: without these the lookup silently falls through to
+        # DEFAULT_V2_BLOCK_CONFIG (32/512/32/256), which is tuned for H=6144
+        # and badly under-blocks H=4096. 1024 tok 0.491 -> 0.296 ms (1.66x),
+        # 16384 tok 7.858 -> 4.575 ms (1.72x). At 200K ctx / dp=1 the 16384
+        # bucket is the whole prefill path, where MoE was 24% of the step.
+        # Decode buckets (tuned 2026-09-12, same harness, 15 candidates each).
+        # These were the last silent DEFAULT_V2_BLOCK_CONFIG fallthroughs on
+        # this shape.
+        #
+        # Honest sizing: the win here is small, 1.01-1.05x, not the 1.7x the
+        # prefill buckets got. At these token counts the tuner clamps bt/btc to
+        # 8 regardless, so the only free parameters left are bf and bse, and
+        # DEFAULT's bf=512/bse=256 is already nearly right:
+        #
+        #     tokens   default-shape   best
+        #        16      0.124 ms      0.119 ms  bf=1024 bse=512
+        #        32      0.178 ms      0.170 ms  bf=1024 bse=512
+        #        64      0.187 ms      0.179 ms  bf=1024 bse=512
+        #       128      0.209 ms      0.207 ms  bf=512  bse=512
+        #
+        # MoE is ~12% of decode device time, so this is ~0.5% of TPOT. Worth
+        # having because it is measured and costs nothing, not because it moves
+        # the number.
+        ('bfloat16', 'float8_e4m3fn', 16, 288, 8, 4096, 2048, 16, True, False, True): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 32, 288, 8, 4096, 2048, 16, True, False, True): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 64, 288, 8, 4096, 2048, 16, True, False, True): (8, 1024, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 288, 8, 4096, 2048, 16, True, False, True): (8, 512, 8, 512, 8),
+        ('bfloat16', 'float8_e4m3fn', 1024, 288, 8, 4096, 2048, 16, True, False, True): (64, 2048, 64, 1024, 64),
+        # 16384: bt=256/btc=128 (4.293) edges out the symmetric bt=btc=128
+        # (4.578). Six of the 40 candidates (bt>=512 with bf>=1024) VMEM-OOM
+        # during autotune and are simply skipped -- that is the tuner working,
+        # not a failure.
+        ('bfloat16', 'float8_e4m3fn', 16384, 288, 8, 4096, 2048, 16, True, False, True): (256, 1024, 128, 1024, 256),
+        # Same shape, shared expert run OUTSIDE the kernel (see
+        # layers/fused_moe._shared_expert_dense). Re-swept 2026-09-13 rather
+        # than carried over: the in-kernel entry above was the best of a
+        # *smaller* feasible set, so it says nothing about this one. 48 of 594
+        # valid candidates, 28 measured / 7 VMEM-or-SMEM OOM.
+        #   3.797  in-kernel (the entry above, shared expert included)
+        #   3.685  routed-only at that same block config
+        #   2.671  bse 1024 -> 256: the freed VMEM is the larger half of the win
+        #   2.486  + bt 256 -> 512, btc 128 -> 256   <- this entry
+        # Runner-up (256, 1024, 144, 256, 144) at 2.503 is within noise of the
+        # winner, so bt=512 is not load-bearing on its own -- bse is.
+        ('bfloat16', 'float8_e4m3fn', 16384, 288, 8, 4096, 2048, 16, False, False, True): (512, 1024, 256, 256, 256),
+        # 65536 = chunked_prefill 16384 x dp_size 4, i.e. the dp=4 prefill bucket.
+        # Same winner shape as 16384. 31.407 -> 17.066 ms (1.84x).
+        # 32768 (the dp=2 bucket) is not swept yet and still falls back to DEFAULT.
+        ('bfloat16', 'float8_e4m3fn', 65536, 288, 8, 4096, 2048, 16, True, False, True): (256, 1024, 128, 1024, 256),
+        # 131072 = the dp=8 prefill bucket. Same winner again (33.973 ms; the
+        # next candidate that satisfies bse<=bf and bt<=bts is 55.966). Note
+        # 65536 -> 131072 is 17.066 -> 33.973 ms, i.e. exactly linear: MoE has
+        # no economy of scale here, so every padded token is pure loss.
+        ('bfloat16', 'float8_e4m3fn', 131072, 288, 8, 4096, 2048, 16, True, False, True): (256, 1024, 128, 1024, 256),
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
@@ -168,6 +231,37 @@ def get_simplified_key(
     )
 
 
+def _env_override(num_tokens: int) -> tuple[int, ...] | None:
+    """Override one bucket's block config from the environment, for in-situ sweeps.
+
+    The table above was swept with bench_v2.py, which feeds the kernel a
+    *balanced* token-to-expert distribution. Real routing is not balanced, and
+    the kernel's cost is sum(ceil(count_e / bt)) blocks -- so a large ``bt`` is
+    free in the bench and expensive in production. Re-sweeping inside the real
+    server is the only way to see that, and editing the table for each candidate
+    means a source change per data point.
+
+    Format: ``SGLANG_JAX_MOE_V2_BLOCK_CFG=<num_tokens>:bt,bf,btc,bse,bts``,
+    semicolon-separated for several buckets. ``bts`` may be ``none``.
+    """
+    spec = os.environ.get("SGLANG_JAX_MOE_V2_BLOCK_CFG", "").strip()
+    if not spec:
+        return None
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        bucket, _, values = part.partition(":")
+        if int(bucket) != num_tokens:
+            continue
+        fields = [None if v.strip().lower() == "none" else int(v) for v in values.split(",")]
+        if len(fields) != 5:
+            raise ValueError(f"SGLANG_JAX_MOE_V2_BLOCK_CFG: {part!r} needs 5 fields")
+        logger.warning("v2 block config for num_tokens=%d overridden to %s", num_tokens, fields)
+        return tuple(fields)
+    return None
+
+
 def get_tuned_fused_moe_v2_block_config(
     *,
     num_tokens: int,
@@ -217,6 +311,10 @@ def get_tuned_fused_moe_v2_block_config(
         cfg_tuple = _lookup(table_key)
     if cfg_tuple is None:
         cfg_tuple = _lookup(table_key_legacy)
+
+    override = _env_override(num_tokens)
+    if override is not None:
+        cfg_tuple = override
 
     if cfg_tuple is None:
         return DEFAULT_V2_BLOCK_CONFIG

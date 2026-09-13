@@ -159,6 +159,99 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 64): (16, 32),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 128): (8, 16),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 256, 256): (4, 64),
+        # ===== GLM-5.3-Flash DP1 / DP2 / 200K =====
+        # 同一批调优（2026-09-10，.127 / .117 单机 8 device，kv_len=204800）。
+        # attention_tp = tp/dp 决定每 rank 的 Q head 数：dp1 -> 4，dp2 -> 8。
+        # per-shard mnt 与 dp 无关（= chunked-prefill-size 及其下层桶）。
+        # 热点 mnt=16384 的纯 kernel 时间随 head 数近似线性：
+        #   4 head 66.5ms / 8 head 120.4ms / 16 head 229.9ms
+        # 相对启发式的提升：mixed +73~97%，decode +32~68%。
+        # 注意 4/8 head 的最优 bkv_p 是 32，和 16 head 的 8 不同，不能互相套用。
+        #
+        # 2026-09-12 复扫：上一批的 bq 上限 256 是 get_block_spec_config_mla.py 里
+        # `_BQ_MIXED_CANDIDATES` 的网格天花板，不是最优点。bq 决定整条 KV 被重复
+        # 读几遍（num_bq = mnt/bq），200K 下这笔 HBM 流量很可观。放开网格后
+        # 4 head / mnt=16384 的最优点移到 (8, 1024) = 57.5ms，比 (32, 256) 的
+        # 66.5ms 快 13.6%。bq=2048 起全部 SKIP_VMEM（acc/l/m/q 四个 ref 就吃掉
+        # ~44MB，超过 57.6MiB 上限）。三个热点桶都是 (8, 1024) 最优：
+        #   mnt=4096  14.81 -> 13.90ms (+6.1%)
+        #   mnt=8192  30.74 -> 28.08ms (+8.7%)
+        #   mnt=16384 66.55 -> 57.52ms (+13.6%)
+        # 复现：get_block_spec_config_mla.py --cases mixed --num-q-heads 4
+        #       --page-sizes 64 --mixed-mnt 16384 --mixed-kv-len 204800
+        #       --mixed-bq 128,256,512,1024,2048 --mixed-bkv-p 1,2,4,8,16,32
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 1): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 2): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 4): (32, 4),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 8): (32, 8),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 16): (32, 16),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 32): (32, 32),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 64): (32, 64),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 4096): (8, 1024),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 8192): (8, 1024),
+        ("mixed", "bfloat16", "bfloat16", 4, 512, 64, 64, 16384): (8, 1024),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 1): (32, 1, 1),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 2): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 4): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 8): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 16): (32, 1, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 4),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8): (32, 8),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 16): (32, 16),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 32): (32, 32),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 64): (32, 64),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (32, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (32, 256),
+        ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 16384): (32, 256),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1, 1),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 8): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 16): (32, 1, 4),
+        # MIXED-only 的 prefill 调用里，wrapper 会连带发出零工作量的 decode 槽。
+        # 照抄硬编码 fallback，只为让 lookup 审计干净（HLO 不变，不触发重编译）。
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 4096): (3, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 8192): (3, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 16384): (3, 1, 4),
+        # ===== GLM-5.3-Flash DP4 / 200K (dense MLA layers; DSA 未实现，11 层
+        # 走 fa 回退到 MLA v2) =====
+        # 部署：--tp-size 16 --dp-size 4 --page-size 64 => attention_tp=4，
+        # 每 rank 64/4 = 16 个 Q head。per-shard mnt = 全局桶 / dp_size：
+        #   prefill  chunked-prefill=16384，全局桶 [16384,32768,65536]
+        #            -> mixed mnt {4096, 8192, 16384}
+        #   decode   bs 桶 [1,8,16,32,64] -> per-shard mnt {1,2,4,8,16}
+        #            （MLA wrapper 每次调用同时发 decode 槽和 mixed 槽，所以
+        #             小 mnt 的 mixed 条目也要有，否则 decode 步被 fallback 拖住）
+        #
+        # 调优 2026-09-10，mig-0905 空闲主机 .127（单机 2x2x1，8 device），
+        # kv_len=204800，tries=5。基线是硬编码启发式 mixed=(1,16)/decode=(3,1,4)。
+        #
+        # 提升（纯 kernel device time）：
+        #   mixed  mnt=16384: +92.0%  (0.230s vs 2.888s)  <- prefill 热点
+        #   mixed  mnt=8192:  +92.0%  (0.113s vs 1.409s)
+        #   mixed  mnt=4096:  +92.0%  (0.056s vs 0.696s)
+        #   mixed  mnt<=64:   +78~92% (decode 步的空转槽位)
+        #   decode mnt=1/2:   +64.6% / +67.8%
+        #   decode mnt=4/8/16:+36%
+        # 未调优时 200K/c1 的 TTFT 是 253.8s，账能对上：
+        #   11 层 x 均长 100K 的 mixed kernel x 13 个 chunk ≈ 206s。
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 1): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 2): (32, 1),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 4): (32, 4),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 8): (32, 8),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 16): (32, 16),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 32): (32, 32),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 64): (32, 64),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 4096): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 8192): (8, 256),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 64, 16384): (8, 256),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 1): (32, 1, 1),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 2): (32, 1, 2),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 4): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 8): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 64, 16): (32, 1, 4),
         # ===== DeepSeek-V3 671B (num_q_heads=128 → 16/shard, kv_lora=512,
         # page=128). decode reuses v6e sweep; mixed bq capped at 128 — v7x
         # scoped VMEM limit is 57.6M (< v6e), bq=256 OOMs by 3.6M at mnt≥256.
@@ -246,6 +339,23 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ),  # Capped from 32 to prevent VMEM OOM when dbs=4
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
         ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
+        # ===== GLM-5.3-Flash (TP=16) on TPU v7x, 200K context =====
+        # Deploy: --tp-size 16 --dp-size 1 --page-size 64
+        # → attention_tp = 16 → per-shard num_q_heads = 64/16 = 4.
+        # Tuned 2026-09-12 on zzl-tpu7x-slice-mig-0905 (v7x, 1 chip / 2 cores)
+        # at the shapes this deployment actually runs: kv_len=204800 for both
+        # cases, decode mnt=32 (max-running-requests bucket), mixed mnt=16384
+        # (chunked-prefill size). Both keys were table misses before, so prod
+        # was on the hardcoded fallbacks -- and those fallbacks are very wrong
+        # at this context length:
+        #   decode: (3, 1, 4) 12.42 ms -> (128, 1, 2) 8.18 ms   (+34%)
+        #   mixed:  (1, 16) 2378.93 ms -> (8, 1024)  57.51 ms   (+98%)
+        # The mixed fallback reads 64 KV tokens per 16-query block, which at a
+        # 200K context is ~3200 grid steps of almost pure DMA latency; that one
+        # entry is worth more than everything else in this table put together.
+        # The mixed/16384 winner is the (8, 1024) entry already listed in the
+        # 4-head block above -- this sweep reproduced it independently.
+        ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 32): (128, 1, 2),
     },
 }
 

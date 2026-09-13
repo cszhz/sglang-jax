@@ -435,6 +435,91 @@ def test_chunk_kda_32k_no_zero_length_output_and_final_state_match_naive_recurre
     )
 
 
+def test_chunk_kda_intra_tilings_match_naive_recurrent_kda():
+    """Every ``(chunk_size, sub_chunk_size)`` tiling must give the same answer.
+
+    ``sub_chunk_size`` splits the intra-chunk score construction so the
+    off-diagonal tiles can go to the MXU, which requires refactoring
+    ``exp2(g[i] - g[j])`` into two separately-bounded halves. That is an
+    algebraic identity, so it is only correct if the rescaling is exact -- and
+    the 32K nodes above pin just the default ``(64, None)`` path. This covers
+    the tilings ``get_tuned_kda_chunking`` can actually return, including
+    ``chunk_size`` values that only fit in VMEM once sub-chunking shrinks the
+    ``[BT, BT, K]`` intermediate.
+    """
+    seq_lens = [1024, 512, 512]
+    logical_t = sum(seq_lens)
+    cu_seqlens = jnp.asarray(
+        np.concatenate([[0], np.cumsum(seq_lens, dtype=np.int32)]), dtype=jnp.int32
+    )
+
+    keys = jax.random.split(jax.random.PRNGKey(531), 8)
+    shape = (1, logical_t, _H, _K)
+    q = (0.1 * jax.random.normal(keys[0], shape, dtype=jnp.float32)).astype(jnp.bfloat16)
+    k = (0.1 * jax.random.normal(keys[1], shape, dtype=jnp.float32)).astype(jnp.bfloat16)
+    v = (0.1 * jax.random.normal(keys[2], shape, dtype=jnp.float32)).astype(jnp.bfloat16)
+    raw_g = (0.25 + 0.2 * jax.random.normal(keys[3], shape, dtype=jnp.float32)).astype(jnp.bfloat16)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, logical_t, _H), dtype=jnp.float32)).astype(
+        jnp.bfloat16
+    )
+    A_log = -1.5 + 0.1 * jax.random.normal(keys[5], (_H,), dtype=jnp.float32)
+    dt_bias = 0.1 + 0.2 * jax.random.normal(keys[6], (_H, _K), dtype=jnp.float32)
+    initial_state = 0.01 * jax.random.normal(
+        keys[7], (len(seq_lens), _H, _K, _V), dtype=jnp.float32
+    )
+    scale = _K**-0.5
+
+    activated_g = -jnp.exp(A_log.astype(jnp.float32))[None, None, :, None] * (
+        jax.nn.softplus(raw_g.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, None, :, :])
+    )
+    reference_output, reference_final_state = _full_naive_reference(
+        seq_lens, cu_seqlens, q, k, v, activated_g, beta, initial_state, scale
+    )
+    assert np.isfinite(np.asarray(reference_output)).all()
+
+    for chunk_size, sub_chunk_size in [
+        (64, None),
+        (64, 16),
+        (128, 16),
+        (128, 32),
+        (256, 16),
+        (256, 32),
+    ]:
+        output, final_state, *_ = chunk_kda(
+            q,
+            k,
+            v,
+            raw_g,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            sub_chunk_size=sub_chunk_size,
+            use_gate_in_kernel=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+        )
+        tiling = f"chunk_size={chunk_size} sub_chunk_size={sub_chunk_size}"
+        assert output.shape == (1, logical_t, _H, _V), tiling
+        assert np.isfinite(np.asarray(output)).all(), tiling
+        np.testing.assert_allclose(
+            np.asarray(output),
+            np.asarray(reference_output),
+            rtol=2e-2,
+            atol=1e-2,
+            err_msg=tiling,
+        )
+        np.testing.assert_allclose(
+            np.asarray(final_state),
+            np.asarray(reference_final_state),
+            rtol=2e-2,
+            atol=1e-2,
+            err_msg=tiling,
+        )
+
+
 def test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunks():
     """Characterize caller mapping, both scan directions, dtype/layout, and masks."""
     chunk_size = 4

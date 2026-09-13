@@ -5,7 +5,8 @@
 #   - tops/utils.py (cdiv, align_up, pad_to_multiple, prepare_lens, prepare_chunk_indices, assert_shape, assert_shape_or_none)
 #   - tops/ops/utils.py (exp, exp2, get_interpret)
 #   - tops/ops/common/cumsum.py (chunk_local_cumsum_vector via _chunk_cumsum_kernel)
-#   - tops/ops/kda/chunk_intra_fwd.py (_solve_unit_lower_triangular, _kda_fwd_intra_kernel, kda_fwd_intra)
+#   - tops/ops/kda/chunk_intra_fwd.py (_solve_unit_lower_triangular -> replaced by
+#     _invert_unit_lower_triangular, _kda_fwd_intra_kernel, kda_fwd_intra)
 #   - tops/ops/common/chunk_delta_h.py (_prepare_chunk_offsets, _chunk_gated_delta_rule_fwd_kernel, chunk_gated_delta_rule_fwd_h)
 #   - tops/ops/gla/chunk.py (_chunk_kda_fwd_o_gk_varlen_kernel renamed to _chunk_kda_fwd_o_gk_pl_kernel, chunk_kda_fwd_o_gk_varlen renamed to chunk_kda_fwd_o_gk)
 #   - tops/ops/kda/gate.py (kda_gate_chunk_cumsum, pallas_kda_gate_cumsum)
@@ -127,6 +128,13 @@ def exp2(x):
 def get_interpret() -> bool:
     env = os.environ.get("PALLAS_INTERPRET", "")
     return env.strip().lower() in ("1", "true")
+
+
+# NOTE: the `precision=HIGHEST` on the stage-3/4 dots below looks expensive --
+# under XLA, HIGHEST on f32 operands is emulated with six bf16 MXU passes -- but
+# Pallas/Mosaic does not do that emulation, so it is free here.  Measured on
+# v7x, T=16384 H=16: HIGHEST 107.376 ms vs DEFAULT 106.791 ms (0.5%), and HIGH
+# raises "Unsupported dot precision".  Don't bother plumbing a knob for it.
 
 
 # ============================================================================
@@ -300,54 +308,152 @@ def chunk_local_cumsum_vector(
 # ============================================================================
 
 
-def _solve_unit_lower_triangular(A, b):
-    N, D = b.shape
-    BS = 16
-    num_blocks = N // BS
+def _invert_unit_lower_triangular(A):
+    """Explicit inverse of ``I + A`` for strictly lower triangular ``A``.
+
+    This is blocked forward substitution reassociated so that every step is a
+    full ``[N, N]`` matmul on the MXU. Writing ``M_s`` for the block diagonal
+    of ``I + A`` at block size ``s``, two neighbouring blocks merge as
+
+        M_{2s}^-1 = M_s^-1 - M_s^-1 C_s M_s^-1
+
+    with ``C_s`` equal to ``A`` masked down to the lower off-diagonal block of
+    each pair. That is just ``[[A, 0], [C, B]]^-1 = [[A^-1, 0],
+    [-B^-1 C A^-1, B^-1]]`` written without slicing, so it inherits the
+    stability of substitution rather than that of a Neumann series. Starting
+    from ``M_1^-1 = I`` it costs ``2*log2(N)`` matmuls at a serial depth of
+    ``2*log2(N)``, against the ``N`` dependent single-row updates of a literal
+    forward substitution -- 14 steps instead of 128 at ``N = 128``. The extra
+    FLOPs are free here: the row updates were latency-bound on the VPU and ran
+    the MXU at a few percent of peak.
+
+    The caller needs ``A_inv`` itself as a kernel output, so forming the
+    inverse explicitly costs nothing over solving against an identity column
+    block the way ``_solve_unit_lower_triangular`` did.
+    """
+    N = A.shape[0]
     A = A.astype(jnp.float32)
-    b = b.astype(jnp.float32)
+    minv = jnp.eye(N, dtype=jnp.float32)
+    contract = (((1,), (0,)), ((), ()))
+    # Built with jnp, not numpy: pallas_call rejects captured host constants.
+    idx = jnp.arange(N, dtype=jnp.int32)
+    s = 1
+    while s < N:
+        block = idx // s
+        # Row block odd, column block immediately to its left.
+        keep = ((block[:, None] % 2) == 1) & (block[None, :] == block[:, None] - 1)
+        c = jnp.where(keep, A, 0.0)
+        cm = jax.lax.dot_general(c, minv, contract, preferred_element_type=jnp.float32)
+        minv = minv - jax.lax.dot_general(minv, cm, contract, preferred_element_type=jnp.float32)
+        s *= 2
+    return minv
 
-    blocks = jnp.split(b, num_blocks, axis=0)
 
-    for i in range(num_blocks):
-        start = i * BS
-        end = (i + 1) * BS
-        A_ii = A[start:end, start:end]
-        x_block = blocks[i]
+def _intra_scores_elementwise(q_f32, k_f32, g_f32, BT, scale):
+    """Aqk / L for one chunk, straight from ``exp2(g[i] - g[j])``.
 
-        rows = [x_block[r] for r in range(BS)]
-        for j in range(BS):
-            if j > 0:
-                vec = A_ii[j, :j][None, :]
-                mat = jnp.stack(rows[:j])
-                correction = jax.lax.dot_general(
-                    vec,
-                    mat,
-                    (((1,), (0,)), ((), ())),
-                    preferred_element_type=jnp.float32,
-                ).squeeze(axis=0)
-                rows[j] = rows[j] - correction
+    For causal (i >= j) the gate cumsum is non-increasing, so g[i]-g[j] <= 0
+    and exp2 lands in (0, 1]. That is why this form is written as a three-way
+    elementwise product rather than the factored ``exp2(g[i]) * exp2(-g[j])``:
+    the factored version overflows as soon as the cumulative gate over the
+    chunk passes ~127 in log2. The price is a [BT, BT, K] intermediate and a
+    VPU reduction where an MXU matmul would do -- see
+    ``_intra_scores_subchunked`` for the version that gets the matmul back.
+    """
+    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
+    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
 
-        x_block = jnp.stack(rows)
-        blocks[i] = x_block
+    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
+    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
+    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
+    # they will be zeroed by causal_bt / strict_bt anyway.
+    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
+    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
 
-        if i < num_blocks - 1:
-            rest_start = (i + 1) * BS
-            x_rest = jnp.concatenate(blocks[i + 1 :], axis=0)
-            A_rest = A[rest_start:, start:end]
-            update = jax.lax.dot_general(
-                A_rest,
-                x_block,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
+    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
+    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
+    Aqk = Aqk * causal_bt
+
+    # L[i, j] = sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j; beta applied by
+    # the caller)
+    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * strict_bt
+    return Aqk, L
+
+
+def _intra_scores_subchunked(q_f32, k_f32, g_f32, BT, BS, scale):
+    """Same Aqk / L, but with the off-diagonal tiles done on the MXU.
+
+    The elementwise form above spends BT*BT*K transcendentals and a VPU
+    reduction per chunk-head; at BT=128, K=128 that is 2.1M exp2 and ~21M VPU
+    ops, which is why ``kda_fwd_intra`` runs two orders of magnitude below the
+    MXU-bound kernels next to it.
+
+    The contraction does factor -- ``exp2(g[i]-g[j]) = exp2(g[i]-c) *
+    exp2(c-g[j])`` for any c -- it just needs a c that keeps both halves from
+    overflowing. Taking c per row-block gives one: with ``c = g[s]``, s the
+    first row of the row-block,
+
+      - rows i >= s of the block have g[i] <= g[s], so ``exp2(g[i]-c) <= 1``;
+      - columns j <  s have g[j] >= g[s], so ``exp2(c-g[j]) <= 1``.
+
+    Both halves are in (0, 1], so the strictly-earlier part of each row-block
+    is an ordinary [BS, K] x [K, BT] matmul. Only the BS x BS block on the
+    diagonal -- where j >= s and the column half can overflow -- keeps the
+    elementwise form, cutting the [.., .., K] intermediate from BT*BT*K to
+    NS*BS*BS*K, i.e. by BT/BS.
+
+    Underflow is the benign direction: if ``exp2(g[i]-c)`` flushes to zero the
+    true entry is ~0 as well, because the other half is <= 1.
+
+    The column half is computed over all BT columns (with the exponent clamped
+    at 0, which only touches entries that are masked away) rather than over
+    just the first s, so every matmul has the same lane-aligned shape.
+    """
+    assert BT % BS == 0, f"chunk_size {BT} must be a multiple of sub_chunk_size {BS}"
+    causal_bs = jnp.tril(jnp.ones((BS, BS), dtype=jnp.float32))
+    strict_bs = jnp.tril(jnp.ones((BS, BS), dtype=jnp.float32), k=-1)
+
+    aqk_rows = []
+    l_rows = []
+    for b in range(BT // BS):
+        s, e = b * BS, (b + 1) * BS
+        g_blk = g_f32[s:e]  # [BS, K]
+        q_blk = q_f32[s:e]
+        k_blk = k_f32[s:e]
+
+        # --- diagonal BS x BS tile: exact elementwise form ---
+        g_diff = g_blk[:, None, :] - g_blk[None, :, :]
+        g_diff = jnp.where(causal_bs[:, :, None] > 0, g_diff, -126.0)
+        dec_d = exp2(jnp.maximum(g_diff, -126.0))  # [BS, BS, K]
+        aqk_d = scale * jnp.sum(q_blk[:, None, :] * dec_d * k_blk[None, :, :], -1)
+        aqk_d = aqk_d * causal_bs
+        l_d = jnp.sum(k_blk[:, None, :] * dec_d * k_blk[None, :, :], -1) * strict_bs
+
+        if b == 0:
+            aqk_row, l_row = aqk_d, l_d
+        else:
+            c = g_f32[s : s + 1]  # [1, K], the row-block's leading cumsum
+            row_dec = exp2(g_blk - c)  # <= 1 by construction
+            col_dec = exp2(jnp.minimum(c - g_f32, 0.0))  # [BT, K], clamped
+            kc = k_f32 * col_dec
+            contract = (((1,), (1,)), ((), ()))
+            aqk_off = scale * jax.lax.dot_general(
+                q_blk * row_dec, kc, contract, preferred_element_type=jnp.float32
             )
-            x_rest = x_rest - update
-            remaining = num_blocks - 1 - i
-            new_blocks = jnp.split(x_rest, remaining, axis=0)
-            for idx, nb in enumerate(new_blocks):
-                blocks[i + 1 + idx] = nb
+            l_off = jax.lax.dot_general(
+                k_blk * row_dec, kc, contract, preferred_element_type=jnp.float32
+            )
+            aqk_row = jnp.concatenate([aqk_off[:, :s], aqk_d], axis=1)
+            l_row = jnp.concatenate([l_off[:, :s], l_d], axis=1)
 
-    return jnp.concatenate(blocks, axis=0)
+        if e < BT:
+            pad = jnp.zeros((BS, BT - e), jnp.float32)
+            aqk_row = jnp.concatenate([aqk_row, pad], axis=1)
+            l_row = jnp.concatenate([l_row, pad], axis=1)
+        aqk_rows.append(aqk_row)
+        l_rows.append(l_row)
+
+    return jnp.concatenate(aqk_rows, axis=0), jnp.concatenate(l_rows, axis=0)
 
 
 def _kda_fwd_intra_kernel(
@@ -364,6 +470,7 @@ def _kda_fwd_intra_kernel(
     Akk_inv_out_ref,
     *,
     chunk_size,
+    sub_chunk_size,
     head_dim,
     value_dim,
     scale,
@@ -384,37 +491,28 @@ def _kda_fwd_intra_kernel(
     k_f32 = k.astype(jnp.float32)
     beta_f32 = beta.astype(jnp.float32)
 
-    # Build Aqk and L directly using exp2(g[i] - g[j]).
-    # For causal (i >= j): g_cumsum[i] <= g_cumsum[j], so g[i]-g[j] <= 0,
-    # giving exp2 in (0, 1].  This avoids the split-normalization overflow
-    # that occurs with exp2(g-gn) when per-step gate changes exceed ~127.
-    causal_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32))
-    strict_bt = jnp.tril(jnp.ones((BT, BT), dtype=jnp.float32), k=-1)
-
-    # g_diff[i, j, k] = g[i, k] - g[j, k];  shape [BT, BT, K]
-    g_diff = g_f32[:, None, :] - g_f32[None, :, :]
-    # Mask anti-causal entries to -126 before exp2 to prevent overflow;
-    # they will be zeroed by causal_bt / strict_bt anyway.
-    g_diff = jnp.where(causal_bt[:, :, None] > 0, g_diff, -126.0)
-    decay = exp2(jnp.maximum(g_diff, -126.0))  # [BT, BT, K]
-
-    # Aqk[i, j] = scale * sum_k q[i,k] * k[j,k] * decay[i,j,k]
-    Aqk = scale * jnp.sum(q_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1)
-    Aqk = (Aqk * causal_bt).astype(dtype)
-
-    # L[i, j] = beta[i] * sum_k k[i,k] * k[j,k] * decay[i,j,k]   (i > j)
-    L = jnp.sum(k_f32[:, None, :] * decay * k_f32[None, :, :], axis=-1) * beta_f32 * strict_bt
+    if sub_chunk_size is None or sub_chunk_size >= BT:
+        Aqk, L = _intra_scores_elementwise(q_f32, k_f32, g_f32, BT, scale)
+    else:
+        Aqk, L = _intra_scores_subchunked(q_f32, k_f32, g_f32, BT, sub_chunk_size, scale)
+    Aqk = Aqk.astype(dtype)
+    L = L * beta_f32
 
     v_beta = v.astype(jnp.float32) * beta_f32
     k_eg_beta = k_f32 * exp2(g_f32) * beta_f32
-    identity = jnp.eye(BT, dtype=jnp.float32)
 
-    combined_b = jnp.concatenate([v_beta, k_eg_beta, identity], axis=-1)
-    combined_x = _solve_unit_lower_triangular(L, combined_b)
+    # A_inv is a kernel output in its own right, so build it directly and get
+    # u / w from one matmul instead of solving against [v, k, I] column-wise.
+    A_inv = _invert_unit_lower_triangular(L)
+    combined_x = jax.lax.dot_general(
+        A_inv,
+        jnp.concatenate([v_beta, k_eg_beta], axis=-1),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
 
     u = combined_x[:, :value_dim]
     w = combined_x[:, value_dim : value_dim + head_dim]
-    A_inv = combined_x[:, value_dim + head_dim :]
 
     g_last = g_f32[BT - 1 : BT, :]
     kg = k_f32 * exp2(g_last - g_f32)
@@ -433,6 +531,7 @@ def _kda_fwd_intra_kernel(
     jax.jit,
     static_argnames=[
         "chunk_size",
+        "sub_chunk_size",
         "scale",
         "safe_gate",
         "disable_recompute",
@@ -450,6 +549,7 @@ def kda_fwd_intra(
     chunk_indices=None,
     safe_gate=True,
     disable_recompute=False,
+    sub_chunk_size=None,
 ):
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
     B, T, H, K = q.shape
@@ -524,6 +624,7 @@ def kda_fwd_intra(
         functools.partial(
             _kda_fwd_intra_kernel,
             chunk_size=BT,
+            sub_chunk_size=sub_chunk_size,
             head_dim=K,
             value_dim=V,
             scale=scale,
@@ -1131,6 +1232,7 @@ def _unalign_output(o, orig_cu_seqlens, aligned_cu_seqlens, T_out):
         "output_final_state",
         "use_qk_l2norm_in_kernel",
         "chunk_size",
+        "sub_chunk_size",
         "safe_gate",
         "lower_bound",
         "use_gate_in_kernel",
@@ -1153,6 +1255,7 @@ def chunk_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     chunk_indices: jax.Array | None = None,
     chunk_size: int = 64,
+    sub_chunk_size: int | None = None,
     safe_gate: bool = True,
     lower_bound: float | None = None,
     use_gate_in_kernel: bool = False,
@@ -1257,6 +1360,7 @@ def chunk_kda_fwd(
         scale=scale,
         safe_gate=safe_gate,
         chunk_size=BT,
+        sub_chunk_size=sub_chunk_size,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )

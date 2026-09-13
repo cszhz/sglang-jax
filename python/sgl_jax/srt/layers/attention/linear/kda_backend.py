@@ -13,6 +13,7 @@ from sgl_jax.srt.kernels.kda import (
     kda_forward_packed,
     naive_recurrent_kda,
 )
+from sgl_jax.srt.kernels.kda.tuned_chunk_size import get_tuned_kda_chunking
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -370,6 +371,15 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             )
         use_mega = kernel == "mega"
 
+        # The kernel runs inside shard_map, so tune on the per-shard head count.
+        # Only the chunked kernel takes these; Mega KDA has no sub-chunking and
+        # its own BT was not swept here, so it keeps its default.
+        chunk_size, sub_chunk_size = get_tuned_kda_chunking(
+            num_heads=H // self.mesh.shape["tensor"],
+            head_dim=q.shape[-1],
+            value_dim=v.shape[-1],
+        )
+
         def _prefill_call(q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias):
             operands = (q, k, v, g, beta, initial_state, cu_seqlens, A_log, dt_bias)
 
@@ -391,6 +401,8 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
                     A_log=A_log,
                     dt_bias=dt_bias,
                     lower_bound=lower_bound,
+                    chunk_size=chunk_size,
+                    sub_chunk_size=sub_chunk_size,
                 )
                 return o, final_state
 

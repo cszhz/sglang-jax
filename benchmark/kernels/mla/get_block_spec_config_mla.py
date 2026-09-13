@@ -71,6 +71,8 @@ _BKV_P_CANDIDATES = (1, 2, 3, 4, 6, 8, 16, 32)
 # Sweeping bq for decode just spawns extra jit cache entries with identical
 # kernels — wasteful and produces noise. Pin to [1].
 _BQ_DECODE_CANDIDATES = (1,)
+# 上限 256 是历史值，不是测出来的最优点——在 GLM-5.3-Flash 的 200K 形状上，KV 要被
+# 重复读 mnt/bq 遍，bq 越小这笔 HBM 流量越大。用 --mixed-bq 可以把网格扫到 256 以上。
 _BQ_MIXED_CANDIDATES = (1, 4, 8, 16, 32, 64, 128, 256)
 _DBS_CANDIDATES = (1, 2, 4, 8, 16, 32)
 
@@ -436,6 +438,8 @@ def _table_key(
 
 
 def main():
+    # 内层搜索网格可被 --mixed-bq / --mixed-bkv-p 覆盖（见下方解析处）。
+    global _BQ_MIXED_CANDIDATES, _BKV_P_CANDIDATES
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--cases",
@@ -443,6 +447,16 @@ def main():
         help="comma-separated subset of decode/mixed",
     )
     parser.add_argument("--tries", type=int, default=5)
+    parser.add_argument(
+        "--mixed-bq",
+        default="",
+        help=f"comma list overriding the mixed bq grid, default {','.join(map(str, _BQ_MIXED_CANDIDATES))}",
+    )
+    parser.add_argument(
+        "--mixed-bkv-p",
+        default="",
+        help=f"comma list overriding the bkv-pages grid, default {','.join(map(str, _BKV_P_CANDIDATES))}",
+    )
     parser.add_argument(
         "--num-q-heads",
         default="",
@@ -489,6 +503,13 @@ def main():
         help="only emit a table entry if tuned beats heuristic by ≥ this %",
     )
     args = parser.parse_args()
+
+    # 覆盖内层搜索网格。改全局而不是往调用链上穿参数：_enum_mixed_candidates 被
+    # 埋在 _tune_mixed 里，穿一路参数改动面反而更大，而这是个单进程的一次性扫描。
+    if args.mixed_bq:
+        _BQ_MIXED_CANDIDATES = tuple(_csv_ints(args.mixed_bq))
+    if args.mixed_bkv_p:
+        _BKV_P_CANDIDATES = tuple(_csv_ints(args.mixed_bkv_p))
 
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
     for c in cases:

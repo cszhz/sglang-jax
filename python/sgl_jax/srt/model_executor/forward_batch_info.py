@@ -358,6 +358,18 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        # `cache_loc` is padded to the whole KV pool (s32[6553600] = 26 MB at
+        # 200K/bs32) and P("data") leaves it whole on every device once dp=1,
+        # so uploading it costs one full copy per local device on every step --
+        # ~210 MB and tens of ms on an 8-chip host, which at decode is several
+        # times the model's own device time. The paged backends derive their
+        # page table from the host-side numpy copy in `get_forward_metadata`
+        # and never touch this array in the graph, so skip the transfer unless
+        # the backend says it reads it. `None` is an existing, supported value
+        # for the field (the dflash worker already sets it), and it is a stable
+        # per-backend choice, so the pytree structure does not vary across
+        # steps.
+        upload_cache_loc = getattr(model_runner.attn_backend, "needs_device_cache_loc", True)
         (
             input_ids,
             seq_lens,
@@ -374,7 +386,7 @@ class ForwardBatch:
                 batch.out_cache_loc,
                 batch.positions,
                 batch.req_pool_indices,
-                batch.cache_loc,
+                batch.cache_loc if upload_cache_loc else None,
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),

@@ -35,6 +35,17 @@ class AttentionBackendMetadata:
 class AttentionBackend(nnx.Module):
     """The base class of attention backends"""
 
+    # Whether ``ForwardBatch.cache_loc`` has to be uploaded to device.
+    #
+    # ``cache_loc`` is the token-granular KV slot list, padded to the whole
+    # pool: at 200K/bs32 that is s32[6553600] = 26 MB, replicated to every
+    # local device on every step. The paged backends never read it on device --
+    # they stride it by ``page_size`` on the host in ``get_forward_metadata``
+    # and upload only the resulting page table -- so for them the transfer is
+    # dead weight that dominates decode. Only backends that index the KV pool
+    # per token inside the graph need it; they opt in.
+    needs_device_cache_loc: bool = False
+
     @abstractmethod
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it"""

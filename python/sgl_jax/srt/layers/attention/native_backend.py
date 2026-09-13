@@ -15,6 +15,9 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 class NativeAttention(AttentionBackend):
     """Native Attention layer for variable-length sequences using ForwardBatch."""
 
+    # `forward_attention` gathers the KV pool by token index inside the graph.
+    needs_device_cache_loc = True
+
     def __init__(
         self,
         num_attn_heads,

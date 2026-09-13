@@ -190,6 +190,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = frozenset(full_attn_layers)
         self._forward_metadata = nnx.data(HybridLinearAttnBackendMetadata())
 
+    @property
+    def needs_device_cache_loc(self) -> bool:
+        # Routing is per layer, so the requirement is whatever either
+        # sub-backend needs.
+        return (
+            self.full_attn_backend.needs_device_cache_loc
+            or self.linear_attn_backend.needs_device_cache_loc
+        )
+
     def get_forward_metadata(self, batch):
         return HybridLinearAttnBackendMetadata(
             full_attn_metadata=self.full_attn_backend.get_forward_metadata(batch),

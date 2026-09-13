@@ -127,6 +127,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             self.precompile_token_paddings,
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
+            self.precompile_extend_bs_paddings,
         ) = target_worker.get_precompile_paddings()
 
     def _share_embed_head_one(self, target_worker: ModelWorker, draft_worker: ModelWorker):

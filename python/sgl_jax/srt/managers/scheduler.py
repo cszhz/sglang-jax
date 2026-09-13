@@ -2601,12 +2601,14 @@ class Scheduler(
             precompile_token_paddings,
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
+            precompile_extend_bs_paddings,
         ) = _worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
             model_worker_batch = batch.get_model_worker_batch(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
+                precompile_extend_bs_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
             )
@@ -2654,6 +2656,7 @@ class Scheduler(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
+                precompile_extend_bs_paddings,
             )
         bid = model_worker_batch.bid
 
@@ -2754,6 +2757,7 @@ class Scheduler(
         precompile_token_paddings,
         precompile_bs_paddings,
         precompile_cache_loc_paddings,
+        precompile_extend_bs_paddings,
     ):
         if batch.forward_mode.is_extend():
             # Spec extend always uses the padded mwb so target and draft
@@ -2763,6 +2767,7 @@ class Scheduler(
                 precompile_token_paddings,
                 precompile_bs_paddings,
                 precompile_cache_loc_paddings,
+                precompile_extend_bs_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
             )

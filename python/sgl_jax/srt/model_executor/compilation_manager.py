@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -64,6 +65,7 @@ class CompilationManager:
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
+        self.extend_bs_buckets = self._compute_extend_bs_buckets()
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
         self._compiled_variants: set[tuple] = set()
         self._compiled_multimodal_extend_shapes: set[tuple[int, int]] = set()
@@ -113,6 +115,61 @@ class CompilationManager:
         if len(buckets) == 0 or buckets[-1] < self.max_padded_batch_size:
             buckets.append(self.max_padded_batch_size)
         return buckets
+
+    def _compute_extend_bs_buckets(self) -> list[int]:
+        """Batch buckets for EXTEND, which -- unlike DECODE -- may go small.
+
+        The ``min_fused_bs = 2 * ep`` floor above exists because in DECODE the
+        fused-MoE kernel is fed one token per request, so bs *is* its token
+        count.  In EXTEND the MoE sees `num_tokens` (a whole prefill chunk)
+        no matter how few requests produced it, so the floor buys nothing and
+        costs a lot: the request axis is padded to that floor, and the KDA
+        stage-3 grid is `(N, H, T // 64)` -- every padded request walks the
+        full chunk dimension.  `pl.when(idx_nt < real_NT)` skips its arithmetic
+        but not the grid itself, measured at ~0.5 us/step on v7x:
+
+            T=16384 H=4   N=32 -> 28.33 ms     N=1 -> 13.29 ms   (2.13x)
+            T=16384 H=16  N=32 -> 107.40 ms    N=1 -> 47.85 ms   (2.24x)
+
+        End to end that is 1.28x on a 200K single-request prefill (TTFT 27.64s
+        -> 21.62s, dp1 tp16 on 8x v7x).
+
+        Only the two endpoints, deliberately.  Each extra bucket is another
+        full extend graph: ~7 min of compile *and* another roll of the
+        compile-time HBM dice -- a 65536-token extend graph needs ~19G of HLO
+        temp (MoE-dominated, near-independent of bs) on top of weights+KV, and
+        at mem_fraction 0.8 that clears the ceiling by tens of MB.  A dp4 run
+        with the full [4,8,16,32,64] ladder died on bs=16 with
+        "Ran out of memory ... Exceeded hbm capacity by 26.02M".  The payoff is
+        concentrated at the bottom, so the ladder is dense there and stops.
+
+        "Dense at the bottom" is not a guess: with long prompts the chunked
+        prefill adder fills a whole chunk from one request, so a DP rank almost
+        always has exactly 1 prefilling request and occasionally 2.  Measured
+        over a 200K c8 run, 15 of 24 steps were `#prefill per DP: [1,1,1,1]`
+        and 4 were `[2,1,1,1]`.  A {dp_size, max} ladder therefore sends those
+        few 2-per-rank steps all the way to the top bucket (per-rank 1 -> 16 on
+        dp4) and thrashes between two executables; that alone cost 9% of TTFT
+        at c8 (165.3s -> 180.3s) while c1/c4/c16 gained 1.16-1.32x.  Hence
+        2 * dp_size.
+
+        Overrides: SGLJAX_EXTEND_BS_LADDER="4,8,64" to set it explicitly, or
+        SGLJAX_DISABLE_EXTEND_BS_LADDER=1 to fall back to the single top
+        bucket, i.e. the exact behaviour from before this ladder existed.
+        """
+        if os.environ.get("SGLJAX_DISABLE_EXTEND_BS_LADDER", "").strip() in ("1", "true"):
+            return [self.max_padded_batch_size]
+
+        override = os.environ.get("SGLJAX_EXTEND_BS_LADDER", "").strip()
+        if override:
+            wanted = {int(x) for x in override.replace(",", " ").split()}
+        else:
+            # dp_size is the smallest batch the scheduler can express (one
+            # request per rank); 2 * dp_size catches the common overflow step.
+            wanted = {self.dp_size, 2 * self.dp_size}
+        # The top bucket must still cover a full batch.
+        wanted = {bs for bs in wanted if self.dp_size <= bs < self.max_padded_batch_size}
+        return sorted(wanted | {self.max_padded_batch_size})
 
     def _compute_cache_loc_buckets(self) -> list[int]:
         # bs reqs together can never exceed max_total_num_tokens, so cap the
@@ -165,16 +222,17 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
-        bs = self.max_padded_batch_size
         multimodal_options = (True,) if self.precompile_in_model_multimodal else (False,)
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s multimodal=%s",
-            [bs],
+            self.extend_bs_buckets,
             self.token_buckets,
             self.precompile_in_model_multimodal,
         )
 
-        pairs = list(itertools.product(multimodal_options, [bs], self.token_buckets))
+        pairs = list(
+            itertools.product(multimodal_options, self.extend_bs_buckets, self.token_buckets)
+        )
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
                 use_multimodal_input, bs_val, num_tokens = pair

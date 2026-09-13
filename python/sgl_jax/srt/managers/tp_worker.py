@@ -381,6 +381,7 @@ class ModelWorker:
             self.compilation_manager.token_buckets,
             self.compilation_manager.bs_buckets,
             self.compilation_manager.cache_loc_buckets,
+            self.compilation_manager.extend_bs_buckets,
         )
 
     def get_model_runner(self):

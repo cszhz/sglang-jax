@@ -71,7 +71,9 @@ class EagleDraftWorker(BaseDraftWorker):
             precompile_token_paddings,
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
+            precompile_extend_bs_paddings,
         ) = target_worker.get_precompile_paddings()
+        self.precompile_extend_bs_paddings = precompile_extend_bs_paddings
         self.precompile_bs_paddings = precompile_bs_paddings
         self.precompile_cache_loc_paddings = precompile_cache_loc_paddings
         self.precompile_token_paddings = precompile_token_paddings

@@ -3059,13 +3059,20 @@ class ScheduleBatch:
         token_paddings: list,
         bs_paddings: list,
         cache_loc_paddings: list,
-        page_size: int,
+        extend_bs_paddings: list | None = None,
+        page_size: int = 1,
         enable_static_lora: bool = False,
     ) -> ModelWorkerBatch:
         if self.forward_mode.is_decode_or_idle():
             token_paddings = bs_paddings
         else:
-            bs_paddings = bs_paddings[-1:]
+            # EXTEND used to collapse to the single top bs bucket, which is the
+            # fused-MoE floor (2 * ep = 32 here) even for one request.  That
+            # padding is not free: KDA stage 3 grids over (N, H, T // 64) and
+            # walks the chunk dimension once per padded request, ~2.1x the
+            # layer for N=32 vs N=1.  `pad_to_bucket` below already picks the
+            # smallest bucket that fits, so hand it the real ladder.
+            bs_paddings = extend_bs_paddings or bs_paddings[-1:]
             cache_loc_paddings = cache_loc_paddings[-1:]
 
         bid = acc_global_bid()

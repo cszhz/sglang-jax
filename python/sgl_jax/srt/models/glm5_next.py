@@ -1329,13 +1329,26 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         )
         loader.load_weights_from_safetensors(self._create_weight_mappings(model_config))
 
-        from sgl_jax.srt.models.glm5_moe import _requantize_glm5_shared_expert
+        from sgl_jax.srt.models.glm5_moe import (
+            _coarsen_moe_quant_block_k,
+            _requantize_glm5_shared_expert,
+        )
+
+        # `or 0` rather than a default: serve_pcp.sh exports the var
+        # unconditionally, so "not set" reaches us as the empty string.
+        coarser_quant_block_k = int(os.environ.get("SGLANG_JAX_MOE_QUANT_BLOCK_K") or 0)
 
         for layer in self.model.layers:
             if not layer.is_kda:
                 layer.self_attn.post_load_weights()
             if isinstance(getattr(layer, "mlp", None), FusedEPMoEV2):
                 _requantize_glm5_shared_expert(layer.mlp)
+                if coarser_quant_block_k:
+                    _coarsen_moe_quant_block_k(layer.mlp, coarser_quant_block_k)
+        if coarser_quant_block_k:
+            logger.info(
+                "Coarsened routed-expert FP8 quant_block_k to %d along K", coarser_quant_block_k
+            )
         logger.info("GLM-5.3 weights loaded; absorbed MLA weights folded.")
 
     def _create_weight_mappings(self, model_config: ModelConfig) -> dict:

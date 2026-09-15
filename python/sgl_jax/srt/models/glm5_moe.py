@@ -5,6 +5,7 @@ from typing import Any
 import jax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
@@ -102,6 +103,93 @@ def _requantize_glm5_shared_expert(mlp: FusedEPMoEV2) -> None:
             delattr(mlp, block_scale_name)
 
     logger.info("Requantized GLM-5.2 shared expert from block-wise to per-channel FP8")
+
+
+_FP8_E4M3_MAX = 448.0
+
+
+@partial(jax.jit, static_argnames=("old_k", "new_k", "quantized_dtype"))
+def _coarsen_k_group(
+    weight_q: jax.Array,  # [E, new_k, N] slice of the K axis
+    scale: jax.Array,  # [E, new_k // old_k, N] scales for that slice
+    *,
+    old_k: int,
+    new_k: int,
+    quantized_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Re-express one K group of an FP8 expert weight under a single scale."""
+    e, _, n = weight_q.shape
+    blocks = weight_q.astype(jnp.float32).reshape(e, new_k // old_k, old_k, n)
+    dequantized = blocks * scale[:, :, None, :]
+    new_scale = jnp.max(jnp.abs(dequantized), axis=(1, 2), keepdims=True) / _FP8_E4M3_MAX
+    new_scale = jnp.where(new_scale == 0.0, 1.0, new_scale)
+    requantized = (dequantized / new_scale).astype(quantized_dtype)
+    return requantized.reshape(e, new_k, n), new_scale.reshape(e, 1, n)
+
+
+def _coarsen_moe_quant_block_k(mlp: FusedEPMoEV2, new_k: int) -> None:
+    """Widen the routed experts' FP8 quantization blocks along K.
+
+    The kernel rescales its accumulator once per ``quant_block_k`` elements of
+    K, so that VPU work scales with ``K / quant_block_k`` while the MXU work
+    does not.  At the checkpoint's ``weight_block_size=[128, 128]`` and this
+    shape it is the larger half of the kernel: replaying the real routing at
+    EP16 / 16384 tokens, one layer costs 3.763 ms at ``quant_block_k=128``,
+    2.909 at 256, 2.576 at 512 and 2.481 at 1024.
+
+    It is not free.  Merging blocks means rounding the weights onto a new FP8
+    grid, a second rounding on top of the checkpoint's own -- measured across
+    layers 5/20/40 it perturbs the stored weights by 2.52% at ``new_k=512``
+    against a 2.45% floor for re-rounding at 128, so nearly all of the cost is
+    the extra rounding rather than the coarser block.  Off by default; set
+    ``SGLANG_JAX_MOE_QUANT_BLOCK_K`` only with an accuracy run to back it.
+    """
+    old_k = getattr(mlp, "quant_block_k", None)
+    if old_k is None or new_k == old_k:
+        return
+    if new_k % old_k or mlp.w1_scale is None:
+        raise ValueError(f"{new_k=} must be a multiple of the checkpoint's {old_k=}")
+
+    with jax.set_mesh(mlp.mesh):
+        for weight_name in ("w1", "w3", "w2"):
+            weight_q = getattr(mlp, weight_name).value  # [E, K, N]
+            scale = getattr(mlp, f"{weight_name}_scale").value[:, :, 0, :]  # [E, K/old_k, N]
+            k_dim = weight_q.shape[1]
+            if k_dim % new_k:
+                raise ValueError(f"{weight_name} K={k_dim} is not a multiple of {new_k=}")
+
+            # One K group at a time: the dequantized f32 view of a whole expert
+            # weight is four times the FP8 original, which at 288 experts does
+            # not fit alongside the rest of the model.
+            per_group = new_k // old_k
+            groups = [
+                _coarsen_k_group(
+                    weight_q[:, g * new_k : (g + 1) * new_k, :],
+                    scale[:, g * per_group : (g + 1) * per_group, :],
+                    old_k=old_k,
+                    new_k=new_k,
+                    quantized_dtype=mlp.quantized_dtype,
+                )
+                for g in range(k_dim // new_k)
+            ]
+            ep_sharding = P(("data", "tensor"), None, None)
+            new_weight = jax.device_put(
+                jnp.concatenate([w for w, _ in groups], axis=1),
+                NamedSharding(mlp.mesh, ep_sharding),
+            )
+            new_scale = jax.device_put(
+                jnp.concatenate([s for _, s in groups], axis=1)[:, :, None, :],
+                NamedSharding(mlp.mesh, P(("data", "tensor"), None, None, None)),
+            )
+            new_weight.block_until_ready()
+            new_scale.block_until_ready()
+            setattr(mlp, weight_name, nnx.Param(new_weight, out_sharding=ep_sharding))
+            setattr(
+                mlp,
+                f"{weight_name}_scale",
+                nnx.Param(new_scale, out_sharding=P(("data", "tensor"), None, None, None)),
+            )
+    mlp.quant_block_k = new_k
 
 
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.

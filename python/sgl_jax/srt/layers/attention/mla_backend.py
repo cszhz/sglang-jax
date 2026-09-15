@@ -14,6 +14,7 @@ projects it through `W_UV → W_O` (see `docs/design/MLA.md` §3.9).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,7 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
+from sgl_jax.srt.kernels.mla.v2.kv_write import write_new_kv
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -132,6 +134,16 @@ class MLAAttentionBackend(AttentionBackend):
         self.num_kv_pages_per_block = num_kv_pages_per_block
         self.num_queries_per_block = num_queries_per_block
         self.decode_batch_size = decode_batch_size
+        self.tp_size = mesh.shape["tensor"] if mesh is not None else 1
+        # Smallest *padded* decode batch at which the request split is worth it;
+        # 0 disables it. The split's cost per step is flat in the batch size --
+        # every rank does one request's worth of full-head attention whether the
+        # batch is 2 or 16 -- so below the crossover it is a pure loss. See
+        # `_decode_split_range`. The padded batch is what the graph is compiled
+        # for (`--precompile-bs-paddings`), so this stays a trace-time decision.
+        self.decode_batch_split = int(
+            os.environ.get("SGLANG_JAX_MLA_DECODE_BATCH_SPLIT", "0") or 0
+        )
 
         self.forward_metadata = nnx.data(MLAAttentionMetadata())
 
@@ -247,6 +259,49 @@ class MLAAttentionBackend(AttentionBackend):
         obj.forward_metadata = children[0]
         return obj
 
+    def _decode_split_range(self, num_decode_seqs: jax.Array, num_tokens: int):
+        """Give each tensor rank a contiguous slice of the decode batch.
+
+        The MLA latent cache is replicated across all `tp_size` ranks (see
+        `MLATokenToKVPool.kv_partition_axis`), so the usual head split leaves
+        every rank streaming the *whole* cache to serve its 1/tp of the heads.
+        At 200K context and 12 concurrent requests that is 2.46 GB per layer
+        per rank -- 16x more traffic than the work requires, and it dominates
+        decode (68% of step time, measured).
+
+        Splitting by request instead inverts it: rank r computes *all* heads
+        for its own requests and touches only their pages. Same FLOPs, 1/tp
+        the bytes per rank, and no LSE needed -- each output row is produced
+        whole by exactly one rank, so plain `psum_scatter` puts it back.
+
+        The cost is load balance: with `num_decode_seqs < tp_size` some ranks
+        idle, and the step is as slow as the rank holding the longest request.
+        Splitting by page instead would balance perfectly but needs the kernel
+        to emit an LSE. Measured on v7x at 200K/c12: request split 5.19x,
+        page split 5.61x -- 92% of the win for none of the kernel surgery.
+
+        Returns `(lo, hi, owner)` where `owner[t]` is the rank that produces
+        output row `t`. Rows past the batch belong to rank 0, which leaves them
+        holding the aliased `ql_nope` exactly as the unsplit path does.
+        """
+        tp = self.tp_size
+        rank = jax.lax.axis_index("tensor")
+        base, extra = num_decode_seqs // tp, num_decode_seqs % tp
+        # Ranks [0, extra) take base+1 requests, the rest take base.
+        lo = rank * base + jnp.minimum(rank, extra)
+        hi = lo + base + (rank < extra)
+
+        t = jnp.arange(num_tokens)
+        big = extra * (base + 1)
+        owner = jnp.where(
+            t < big,
+            t // (base + 1),
+            # base == 0 means every request already fell in the branch above;
+            # clamp only so the dead branch cannot divide by zero.
+            extra + (t - big) // jnp.maximum(base, 1),
+        )
+        return lo, hi, jnp.where(t < num_decode_seqs, owner, 0)
+
     @named_scope
     def __call__(
         self,
@@ -282,21 +337,61 @@ class MLAAttentionBackend(AttentionBackend):
         del v
         q_rope = kwargs.get("q_rope")
         k_rope = kwargs.get("k_rope")
-        if q_rope is None or k_rope is None:
+        # NoPE models (GLM-5.3) omit both: there is no rope tail, so the kernel
+        # runs a pure-latent QK and the cache holds only align_to(kv_lora_rank, 128).
+        has_pe = q_rope is not None
+        if has_pe != (k_rope is not None):
             raise ValueError(
-                "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) "
-                "alongside the non-rope q/k tensors."
+                "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) to be "
+                "passed together, or both omitted for NoPE models."
             )
 
         # Strip the (single) KV-head axis from the latent K/K-rope tensors.
         # Squeezing a length-1 axis preserves any caller-provided sharding on
         # the remaining dims (replicated stays replicated).
         new_kv_c = k if k.ndim == 2 else jnp.squeeze(k, axis=1)
-        new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
         dpa = self.attention_data_partition_axis
-        new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
         ql_nope = q
-        q_pe = q_rope
+        if has_pe:
+            new_k_pe = k_rope if k_rope.ndim == 2 else jnp.squeeze(k_rope, axis=1)
+            new_k_pe = jax.sharding.reshard(new_k_pe, P(dpa, None))
+            q_pe = q_rope
+        # Request-split decode: only for a pure-decode batch on a replicated
+        # cache. EXTEND / target-verify carry a mixed distribution the split
+        # path deliberately drops.
+        # NoPE only: taking the write out of the kernel means reproducing it,
+        # and `write_new_kv` lands just the latent part -- a rope tail would
+        # need the fused layout's second half written too.
+        # NB: the threshold is applied in ForwardBatch.init_new, against
+        # `real_bs`, NOT here against a shape. Two earlier attempts were both
+        # no-ops that silently split everything: `ql_nope.shape[0]` is padded
+        # to a multiple of tp by SP, and `batch_size` is pinned to the single
+        # decode bucket 2*ep=32 by fused MoE. Neither carries concurrency.
+        split = (
+            self.decode_batch_split > 0
+            and forward_batch.mla_decode_split
+            and self.tp_size > 1
+            and not has_pe
+            and forward_batch.forward_mode == ForwardMode.DECODE
+        )
+        if self.decode_batch_split > 0 and forward_batch.forward_mode == ForwardMode.DECODE:
+            # Once per trace, not per step -- this is the only way to see which
+            # way the gate went without guessing from a TPOT number.
+            logger.info(
+                "MLA decode split: %s (flag=%s padded_bs=%d thresh=%d tokens=%d pe=%s)",
+                "ON" if split else "off",
+                forward_batch.mla_decode_split,
+                forward_batch.batch_size,
+                self.decode_batch_split,
+                ql_nope.shape[0],
+                has_pe,
+            )
+        if split:
+            # Every rank needs all the heads of its own requests, so undo the
+            # head split on the way in. 786 KB/layer at c12 -- ~4 us.
+            ql_nope = jax.sharding.reshard(ql_nope, P(dpa, None, None))
+            if has_pe:
+                q_pe = jax.sharding.reshard(q_pe, P(dpa, None, None))
 
         cache = token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
         sm_scale = (
@@ -307,11 +402,21 @@ class MLAAttentionBackend(AttentionBackend):
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
 
+        # On the split path q arrives whole and the output is reduce-scattered
+        # back to the usual head shard inside `_run`.
+        q_spec = P(dpa, None, None) if split else P(dpa, "tensor", None)
+        pe_specs = (
+            (
+                q_spec,  # q_pe       [T, n_h/tp, r]
+                P(dpa, None),  # new_k_pe   [T, r]    (single latent)
+            )
+            if has_pe
+            else ()
+        )
         in_specs = (
-            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
+            q_spec,  # ql_nope    [T, n_h/tp, lkv]
             P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
-            P(dpa, None),  # new_k_pe   [T, r]    (single latent)
+            *pe_specs,
             P(dpa, None, None, None),  # cache (page axis sharded by data)
             P(dpa),  # seq_lens
             P(dpa),  # page_indices
@@ -326,17 +431,28 @@ class MLAAttentionBackend(AttentionBackend):
 
         def _run(
             ql_nope_,
-            q_pe_,
             new_kv_c_,
-            new_k_pe_,
-            cache_,
-            seq_lens_,
-            page_indices_,
-            cu_q_lens_,
-            cu_kv_lens_,
-            distribution_,
+            *rest,
         ):
-            return mla_ragged_paged_attention(
+            if has_pe:
+                q_pe_, new_k_pe_, *rest = rest
+            else:
+                q_pe_ = new_k_pe_ = None
+            (
+                cache_,
+                seq_lens_,
+                page_indices_,
+                cu_q_lens_,
+                cu_kv_lens_,
+                distribution_,
+            ) = rest
+            seq_range = owner = None
+            if split:
+                lo, hi, owner = self._decode_split_range(
+                    distribution_[0], ql_nope_.shape[0]
+                )
+                seq_range = (lo, hi)
+            o_, cache_ = mla_ragged_paged_attention(
                 ql_nope_,
                 q_pe_,
                 new_kv_c_,
@@ -354,7 +470,32 @@ class MLAAttentionBackend(AttentionBackend):
                 num_queries_per_block=self.num_queries_per_block,
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
+                decode_seq_range=seq_range,
+                write_kv_cache=not split,
             )
+            if not split:
+                return o_, cache_
+            # The kernel only touched rows [lo, hi); the rest still hold the
+            # aliased `ql_nope`. Zero those so the reduce-scatter sees exactly
+            # one contributor per row, then hand each rank back its head shard.
+            rank = jax.lax.axis_index("tensor")
+            o_ = jnp.where((owner == rank)[:, None, None], o_, 0)
+            o_ = jax.lax.psum_scatter(
+                o_, "tensor", scatter_dimension=1, tiled=True
+            )
+            # The kernel read the new KV straight from `new_kv_c` this step, so
+            # landing it in the cache afterwards keeps the unsplit ordering. It
+            # has to happen on every rank: each holds a full replica, and next
+            # step's request-to-rank assignment is not guaranteed to be the same.
+            cache_ = write_new_kv(
+                new_kv_c_,
+                cache_,
+                seq_lens_,
+                page_indices_,
+                cu_kv_lens_,
+                distribution_[0],
+            )
+            return o_, cache_
 
         o_latent, updated_cache = jax.shard_map(
             _run,
@@ -363,9 +504,8 @@ class MLAAttentionBackend(AttentionBackend):
             check_vma=False,
         )(
             ql_nope,
-            q_pe,
             new_kv_c,
-            new_k_pe,
+            *((q_pe, new_k_pe) if has_pe else ()),
             cache,
             self.forward_metadata.seq_lens,
             self.forward_metadata.page_indices,

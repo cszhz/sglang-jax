@@ -92,6 +92,13 @@ class CompilationManager:
 
         return buckets
 
+    @staticmethod
+    def _mla_decode_split_variants() -> tuple[bool, ...]:
+        """Values of ForwardBatch.mla_decode_split that need their own graph."""
+        if int(os.environ.get("SGLANG_JAX_MLA_DECODE_BATCH_SPLIT", "0") or 0) <= 0:
+            return (False,)
+        return (False, True)
+
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         is_fused_moe = self.moe_backend in ("fused", "fused_v2")
@@ -326,33 +333,40 @@ class CompilationManager:
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     batch, 0, mesh, self.vocab_size
                 )
-                batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
-                if future_token_ids_map is not None:
-                    from sgl_jax.srt.managers.utils import (
-                        get_token_ids_gather,
-                        resolve_future_token_ids,
-                        set_future_token_ids,
-                    )
+                # `mla_decode_split` is static, so each value is its own graph.
+                # Both have to be built here: the dummy batch's real_bs is the
+                # padded bs, which always clears the threshold, so without this
+                # the non-split graph would compile on the first low-concurrency
+                # request and blow the 300 s watchdog.
+                for mla_split in self._mla_decode_split_variants():
+                    batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                    batch.forward_batch.mla_decode_split = mla_split
+                    if future_token_ids_map is not None:
+                        from sgl_jax.srt.managers.utils import (
+                            get_token_ids_gather,
+                            resolve_future_token_ids,
+                            set_future_token_ids,
+                        )
 
-                    batch.forward_batch.input_ids = resolve_future_token_ids(
-                        batch.forward_batch.input_ids, future_token_ids_map, mesh
+                        batch.forward_batch.input_ids = resolve_future_token_ids(
+                            batch.forward_batch.input_ids, future_token_ids_map, mesh
+                        )
+                    result = forward_fn(
+                        batch,
+                        launch_done=None,
+                        skip_sample=False,
+                        sampling_metadata=sampling_metadata,
                     )
-                result = forward_fn(
-                    batch,
-                    launch_done=None,
-                    skip_sample=False,
-                    sampling_metadata=sampling_metadata,
-                )
-                if future_token_ids_map is not None:
-                    _, next_token_ids, _ = result
-                    set_future_token_ids(
-                        future_token_ids_map,
-                        batch.forward_batch.seq_lens,
-                        batch.forward_batch.req_pool_indices,
-                        next_token_ids,
-                        mesh,
-                    )
-                    get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
+                    if future_token_ids_map is not None:
+                        _, next_token_ids, _ = result
+                        set_future_token_ids(
+                            future_token_ids_map,
+                            batch.forward_batch.seq_lens,
+                            batch.forward_batch.req_pool_indices,
+                            next_token_ids,
+                            mesh,
+                        )
+                        get_token_ids_gather(mesh)(next_token_ids).block_until_ready()
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()

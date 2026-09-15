@@ -418,6 +418,21 @@ def get_tuned_block_sizes_mla(
     )
 
     hit = table.get(key)
+
+    if hit is None and int(qk_rope_head_dim) == 0:
+        # NoPE (GLM-5.3): the whole table was tuned when this model still fed a
+        # zero pe of width 64, so every key carries 64. Dropping the pe removes
+        # 128 of 640 cache lanes -- it changes the per-token KV bytes by -20%,
+        # not the shape of the search space, so the 64-wide tuning point is a
+        # far better starting config than `get_fallback_block_sizes_mla`, which
+        # is tiling-legal but still (1, 16) for mixed on >=16-head shards:
+        # ~2400 ms per call at a 200K context, vs ~58 ms for the tuned entry.
+        # Re-swept at r_dim=0 for the hot mixed mnt=16384 bucket: the retry
+        # picks the same (8, 1024) the dedicated sweep finds, i.e. this is not
+        # merely survivable, it is right. Buckets without a first-class
+        # r_dim=0 entry still come through here.
+        hit = table.get(key[:5] + (64,) + key[6:])
+
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)
         logger.info(

@@ -17,6 +17,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -215,6 +216,15 @@ class ForwardBatch:
     # Host-only multimodal batch consumed before the backbone JIT.
     multimodal_batch: object | None = None
 
+    # Whether the MLA decode backend should split the batch by request instead
+    # of by head. Static (it keys the jit cache), and deliberately a *bool*
+    # rather than the real batch size: fused MoE pins DECODE to the single bs
+    # bucket 2*ep (compilation_manager._compute_bs_buckets), so `batch_size` is
+    # a constant 32 here and carries no concurrency information at all, while
+    # carrying `real_bs` itself would retrace once per distinct value. Two
+    # graphs, host picks per step. See MLAAttention._decode_split_range.
+    mla_decode_split: bool = False
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -248,6 +258,7 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "mla_decode_split": self.mla_decode_split,
         }
         return (children, aux_data)
 
@@ -264,6 +275,7 @@ class ForwardBatch:
         obj.spec_algorithm = aux_data["spec_algorithm"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
         obj.deterministic = aux_data.get("deterministic", True)
+        obj.mla_decode_split = aux_data.get("mla_decode_split", False)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
 
@@ -485,10 +497,19 @@ class ForwardBatch:
 
         multimodal_batch = getattr(batch, "multimodal_batch", None)
 
+        # `real_bs` is the pre-padding request count, which is the only place
+        # concurrency survives -- see the field's comment. Threshold of 0
+        # disables; the backend still re-checks its own preconditions.
+        mla_split_min = int(os.environ.get("SGLANG_JAX_MLA_DECODE_BATCH_SPLIT", "0") or 0)
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
+            mla_decode_split=(
+                mla_split_min > 0
+                and batch.forward_mode == ForwardMode.DECODE
+                and batch.real_bs >= mla_split_min
+            ),
             input_ids=input_ids,
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,

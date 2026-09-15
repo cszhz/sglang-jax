@@ -60,19 +60,22 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
-# GLM-5.3 is NoPE, but the absorbed-MLA path is built around a rope tail: the
-# backend rejects a missing ``q_rope``/``k_rope`` and the v2 Pallas kernel
-# asserts ``align_to(r_dim, 128) % 128 == 0``, which a zero-width ref cannot
-# satisfy. We therefore feed an all-zero pe of this width. It is *exactly*
-# equivalent, not an approximation: q_pe·k_pe = 0 for every pair, and the
-# softmax scale is passed explicitly as ``layer.scaling`` rather than derived
-# from the head dim. The cost is 64 zero elements per token per DSA layer in
-# the KV cache (~12% on top of the 512-wide latent).
+# GLM-5.3 is NoPE. The absorbed-MLA path used to be built around a rope tail,
+# so we fed it an all-zero pe of width 64 — exactly equivalent arithmetically
+# (q_pe·k_pe = 0 for every pair, and the softmax scale comes from
+# ``layer.scaling``, not the head dim), but it cost a *padded* 128 lanes per
+# token per MLA layer in the KV cache: the pool allocates
+# ``align_to(512,128) + align_to(64,128) = 640``, i.e. 20% of KV spent on
+# provably-zero values, plus the DMAs and the QK lanes to match.
+#
+# Both the backend (``mla_backend.py``) and the v2 Pallas kernel now accept
+# ``q_rope=k_rope=None`` and skip every pe DMA/concat, so the width is 0: the
+# pool allocates 512 and the kernel does a pure-latent QK.
 #
 # ``patch_model_config`` writes this same value into
-# ``hf_text_config.qk_rope_head_dim`` so ``MLATokenToKVPool`` allocates
-# ``align_to(512,128) + align_to(64,128) = 640`` and agrees with the kernel.
-_NOPE_PE_WIDTH = 64
+# ``hf_text_config.qk_rope_head_dim`` so ``MLATokenToKVPool`` agrees with the
+# kernel.
+_NOPE_PE_WIDTH = 0
 
 
 def _unweighted_rms_scale(x: jax.Array, eps: float) -> jax.Array:
@@ -677,20 +680,6 @@ class Glm5NextAttention(nnx.Module):
         compressed, _ = self.kv_a_proj_with_mqa(hidden_states)
         compressed = self.kv_a_layernorm(compressed)
 
-        # Zero pe — see _NOPE_PE_WIDTH. Materialized with the shardings the
-        # MLA backend's shard_map expects so no implicit resharding shows up
-        # on the critical path.
-        q_rope = jnp.zeros(
-            (num_tokens, self.num_heads, _NOPE_PE_WIDTH),
-            dtype=q_nope.dtype,
-            out_sharding=P("data", "tensor", None),
-        )
-        k_rope = jnp.zeros(
-            (num_tokens, 1, _NOPE_PE_WIDTH),
-            dtype=compressed.dtype,
-            out_sharding=P("data", None, None),
-        )
-
         # "thd,rhd->thr" — fp32 accumulate, as in glm5_moe: the bf16
         # accumulator on this small batched dot drifts enough over 45 layers to
         # push decode into repetition.
@@ -709,8 +698,7 @@ class Glm5NextAttention(nnx.Module):
             c_kv_3d,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            q_rope=q_rope,
-            k_rope=k_rope,
+            # NoPE: no q_rope/k_rope at all — see _NOPE_PE_WIDTH.
         )
 
         # "thr,rhd->thd" — fp32 accumulate; see ql_nope above.
@@ -1234,16 +1222,11 @@ class Glm5NextForConditionalGeneration(nnx.Module):
         mc.v_head_dim = tc.v_head_dim
         mc.attention_arch = AttentionArch.MLA
 
-        # NoPE, but the KV pool sizes itself as
-        # ``align_to(kv_lora_rank,128) + align_to(qk_rope_head_dim,128)``. Left
-        # at 0 it would allocate 512 while the MLA kernel — fed the zero pe of
-        # width _NOPE_PE_WIDTH — indexes 640. Declare the padding here so pool
-        # and kernel agree.
-        #
-        # This hook runs during ModelConfig construction, i.e. before any layer
-        # exists, so every later reader sees 64, not 0. Glm5NextAttention
-        # therefore validates NoPE via ``mla_use_nope`` / ``qk_head_dim ==
-        # qk_nope_head_dim`` and uses _NOPE_PE_WIDTH directly.
+        # NoPE: the KV pool sizes itself as
+        # ``align_to(kv_lora_rank,128) + align_to(qk_rope_head_dim,128)``, and
+        # with _NOPE_PE_WIDTH == 0 that is a flat 512 — matching the kernel,
+        # which now skips the pe path entirely. (This used to be forced to 64,
+        # costing a padded 128 lanes per token.)
         tc.qk_rope_head_dim = _NOPE_PE_WIDTH
 
         if mc.quantization_config is not None and (

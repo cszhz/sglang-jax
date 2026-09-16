@@ -356,6 +356,38 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # The mixed/16384 winner is the (8, 1024) entry already listed in the
         # 4-head block above -- this sweep reproduced it independently.
         ("decode", "bfloat16", "bfloat16", 4, 512, 64, 64, 32): (128, 1, 2),
+        # --- 2026-09-15: the entry above stopped being reachable ---
+        # `SGLANG_JAX_MLA_DECODE_BATCH_SPLIT` (mla_backend `_decode_split_range`)
+        # gives each rank *all* heads for its own requests instead of 1/tp of
+        # the heads for every request. So `actual_num_q_heads` at the lookup
+        # (kernel.py:1490 `ql_nope.shape[1]`) went 4 -> 64 and the 0912 entry
+        # became a miss; prod silently ran the hardcoded fallback (3, 1).
+        # Confirmed three ways: the server logs
+        #   `LOOKUP MISS key=('decode','bfloat16','bfloat16',64,512,0,64,32)`,
+        # the decode trace shows `MLA-d-bq_1-bkvp_3-p_64-bsz_1`, and
+        # `get_fallback_block_sizes_mla("decode", ...)` returns exactly (3, 1).
+        #
+        # Re-swept at the 64-head shape (1 chip / 2 cores, core 0 only,
+        # kv_len=204800, r_dim=0, 1 active seq per rank -- which is what the
+        # request split actually hands the kernel at bs<=tp):
+        #   bkv_p:   3     4     8    16    24    32    40    48   >=50
+        #   ms:    1.313 1.162 0.894 0.823 0.788 0.772 0.764 0.764  VMEM OOM
+        # 0912's winner bkv_p=128 does NOT fit at 64 heads -- a KV block holds
+        # 16x more query state than at 4 heads, so the useful range moved down
+        # by 4x. Picking 32 (not the 0.764 ms optimum at 40/48): those OOM at
+        # dbs=4, and 32 is within 1% while keeping VMEM headroom.
+        # dbs is a no-op here (BATCHED_DECODE's grid is empty with 1 seq/rank);
+        # kept at the fallback's 4 so only bkv_p changes.
+        #
+        # End-to-end A/B on 8x TPU v7x (TP16/EP16, 190K in / 8192 out), this
+        # entry removed vs present: TPOT c8 22.24 -> 16.69 ms/tok (-25.0%),
+        # c16 23.70 -> 18.24 (-23.0%), throughput +24.9% / +18.6%, TTFT flat.
+        # c1..c4 are unchanged by design -- BATCH_SPLIT's threshold is 8, so
+        # below it each rank still gets 4 heads and hits the entry above.
+        # The win scales with KV length, not with decode's share of wall time:
+        # at a 2K context the same A/B moves TPOT by <1% (too few KV blocks to
+        # retile), so short-context benchmarks will not catch a regression here.
+        ("decode", "bfloat16", "bfloat16", 64, 512, 0, 64, 32): (32, 1, 4),
     },
 }
 
